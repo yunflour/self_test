@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -89,10 +90,17 @@ def run_one(
     if result_file and os.path.exists(result_file):
         result_json = load_json(result_file)
         classification = classify_result(result_json)
+        token_file = result_json.get("token_output_file", "")
+        email = ""
+        token_output = result_json.get("token_output")
+        if isinstance(token_output, dict):
+            email = token_output.get("email", "")
         return {
             "id": tag,
             "status": classification["status"],
             "result_file": result_file,
+            "token_file": token_file,
+            "email": email,
         }
 
     with lock:
@@ -115,10 +123,56 @@ def print_table(rows: list[dict[str, Any]]) -> None:
     sep = "-+-".join("-" * w for w in widths)
     val = " | ".join(v.ljust(w) for v, w in zip(values, widths))
 
-    print("\n结果汇总")
+    print("\n" + "=" * 60)
+    print("结果汇总")
+    print("=" * 60)
     print(line)
     print(sep)
     print(val)
+
+    # 逐条打印详情
+    print("\n详细列表：")
+    print("-" * 60)
+    sorted_rows = sorted(rows, key=lambda r: r.get("id", ""))
+    for r in sorted_rows:
+        status = r.get("status", "unknown")
+        tag = r.get("id", "?")
+        email = r.get("email", "")
+        token_file = r.get("token_file", "")
+        status_icon = {"ok": "✓", "blocked": "✗", "failed": "✗", "unknown": "?"}.get(
+            status, "?"
+        )
+        parts = [f"  {status_icon} [{status:>7s}] {tag}"]
+        if email:
+            parts.append(f"    邮箱: {email}")
+        if token_file:
+            parts.append(f"    文件: {token_file}")
+        print("\n".join(parts))
+    print("-" * 60)
+
+
+def collect_success_files(rows: list[dict[str, Any]], run_id: str) -> str:
+    """
+    将所有注册成功（status=ok）的 token 文件拷贝到 data/<run_id>/ 文件夹中。
+    返回目标文件夹路径。
+    """
+    dest_dir = os.path.join(os.getcwd(), "data", run_id)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    copied = 0
+    for r in rows:
+        if r.get("status") != "ok":
+            continue
+        token_file = r.get("token_file", "")
+        if not token_file or not os.path.isfile(token_file):
+            log(f"任务 {r.get('id')} 状态为 ok 但 token 文件不存在: {token_file}")
+            continue
+        dest_path = os.path.join(dest_dir, os.path.basename(token_file))
+        shutil.copy2(token_file, dest_path)
+        copied += 1
+
+    log(f"已将 {copied} 个成功的 token 文件拷贝到: {dest_dir}")
+    return dest_dir
 
 
 def main() -> None:
@@ -142,6 +196,9 @@ def main() -> None:
     env = os.environ.copy()
     lock = threading.Lock()
 
+    log(f"批量注册开始: count={args.count}, workers={args.workers}, run-id={run_id}")
+    start_time = time.time()
+
     rows: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [
@@ -159,7 +216,17 @@ def main() -> None:
         for fut in as_completed(futures):
             rows.append(fut.result())
 
+    elapsed = time.time() - start_time
     print_table(rows)
+
+    ok_count = sum(1 for r in rows if r.get("status") == "ok")
+    if ok_count > 0:
+        dest_dir = collect_success_files(rows, run_id)
+        log(f"成功文件夹: {dest_dir}")
+    else:
+        log("没有注册成功的账号，跳过文件归集")
+
+    log(f"总耗时: {elapsed:.1f} 秒")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,8 @@
     "camoufoxAutofillEmail": true,
     "saveResult": true,
     "outputJson": false,
-    "callbackPort": null
+    "callbackPort": null,
+    "skipSecondStage": false
   },
   "callbackPorts": [
     3128,

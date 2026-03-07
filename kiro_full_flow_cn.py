@@ -68,6 +68,7 @@ class FlowConfig:
     save_result: bool
     output_json: bool
     callback_port: Optional[int]
+    skip_second_stage: bool
 
 
 @dataclass(frozen=True)
@@ -153,6 +154,7 @@ def load_app_config() -> AppConfig:
             if flow_raw.get("callbackPort") is not None
             else None
         ),
+        skip_second_stage=bool(flow_raw.get("skipSecondStage", False)),
     )
 
     callback_ports_raw = _require_key(raw, "callbackPorts", list)
@@ -758,11 +760,12 @@ class CamoufoxSession:
     在后台线程中托管 AsyncCamoufox 生命周期，便于主流程继续等待本地回调。
     """
 
-    def __init__(self, url: str, headless: bool, os_name: str, auto_fill_email: bool):
+    def __init__(self, url: str, headless: bool, os_name: str, auto_fill_email: bool, skip_second_stage: bool = False):
         self.url = url
         self.headless = headless
         self.os_name = os_name
         self.auto_fill_email = auto_fill_email
+        self.skip_second_stage = skip_second_stage
         self.thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
@@ -1391,34 +1394,39 @@ class CamoufoxSession:
 
                                     self.password_submitted = pwd_submitted
 
-                                allow_access_selector = (
-                                    "button[data-testid='allow-access-button']"
-                                )
-                                try:
+                                if self.skip_second_stage:
                                     self._trace(
-                                        "检查是否进入授权确认页（Allow access）"
+                                        "skip_second_stage=True，跳过 Allow Access，仅完成账号注册"
                                     )
-                                    await page.wait_for_selector(
-                                        allow_access_selector,
-                                        state="visible",
-                                        timeout=180000,
+                                else:
+                                    allow_access_selector = (
+                                        "button[data-testid='allow-access-button']"
                                     )
-                                    allow_btn = page.locator(
-                                        allow_access_selector
-                                    ).first
-                                    await allow_btn.scroll_into_view_if_needed()
-                                    await page.wait_for_timeout(
-                                        random.randint(400, 900)
-                                    )
-                                    await allow_btn.click(timeout=20000)
-                                    self.allow_access_clicked = True
-                                    self._trace(
-                                        "Allow access 点击成功，注册流程收尾完成"
-                                    )
-                                except Exception as allow_err:
-                                    self._trace(
-                                        f"未完成 Allow access 点击：{allow_err}"
-                                    )
+                                    try:
+                                        self._trace(
+                                            "检查是否进入授权确认页（Allow access）"
+                                        )
+                                        await page.wait_for_selector(
+                                            allow_access_selector,
+                                            state="visible",
+                                            timeout=180000,
+                                        )
+                                        allow_btn = page.locator(
+                                            allow_access_selector
+                                        ).first
+                                        await allow_btn.scroll_into_view_if_needed()
+                                        await page.wait_for_timeout(
+                                            random.randint(400, 900)
+                                        )
+                                        await allow_btn.click(timeout=20000)
+                                        self.allow_access_clicked = True
+                                        self._trace(
+                                            "Allow access 点击成功，注册流程收尾完成"
+                                        )
+                                    except Exception as allow_err:
+                                        self._trace(
+                                            f"未完成 Allow access 点击：{allow_err}"
+                                        )
                             except Exception as poll_err:
                                 self.shortmail_poll_error = str(poll_err)
                                 self._trace(
@@ -1492,6 +1500,7 @@ def open_url_in_camoufox(
         headless=headless,
         os_name=os_name,
         auto_fill_email=auto_fill_email,
+        skip_second_stage=FLOW_CONFIG.skip_second_stage,
     )
     session.start()
     ready = session.wait_ready(startup_timeout_s)
@@ -2194,10 +2203,21 @@ def main() -> None:
                     f"{detail}"
                 )
 
-        log(f"等待第二层回调，超时 {config.timeout_s} 秒...")
-        got_stage2 = shared.stage2_event.wait(timeout=config.timeout_s)
-        if not got_stage2:
-            log("超时：未收到 /oauth/callback。请检查浏览器是否完成 AWS 登录。")
+        if config.skip_second_stage:
+            log("skip_second_stage=True，仅完成账号注册，跳过第二层回调和 token 交换")
+            if camoufox_session is not None and camoufox_session.temp_email:
+                final["registration"] = {
+                    "email": camoufox_session.temp_email,
+                    "password": camoufox_session.generated_password,
+                    "full_name": camoufox_session.generated_full_name,
+                    "registered": camoufox_session.password_submitted,
+                }
+                log(f"已注册账号: {camoufox_session.temp_email}")
+        else:
+            log(f"等待第二层回调，超时 {config.timeout_s} 秒...")
+            got_stage2 = shared.stage2_event.wait(timeout=config.timeout_s)
+            if not got_stage2:
+                log("超时：未收到 /oauth/callback。请检查浏览器是否完成 AWS 登录。")
         stage2_result = shared.stage2_result
         if stage2_result is not None:
             final["stage2"]["callback"] = asdict(stage2_result)
