@@ -43,6 +43,7 @@ import requests
 
 
 CONFIG_PATH_ENV = "KIRO_FULL_FLOW_CONFIG"
+RUN_ID_ENV = "KIRO_RUN_ID"
 DEFAULT_CONFIG_PATH = os.path.join(os.getcwd(), "config", "kiro_full_flow_cn.json")
 
 
@@ -241,6 +242,17 @@ def first_available_port(candidates: list[int]) -> int:
     raise RuntimeError(
         "候选端口均不可用，请在 FLOW_CONFIG.callback_port 中指定可用端口"
     )
+
+
+def ensure_available_port(candidates: list[int], retries: int = 3) -> int:
+    last_err: Optional[Exception] = None
+    for _ in range(max(1, retries)):
+        try:
+            return first_available_port(candidates)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.4)
+    raise RuntimeError(f"候选端口均不可用（重试 {retries} 次）：{last_err}")
 
 
 def build_portal_signin_url(
@@ -568,6 +580,21 @@ def normalize_email_for_filename(email: str) -> str:
     return base or "unknown"
 
 
+def normalize_filename_fragment(value: str) -> str:
+    base = value.strip()
+    base = re.sub(r"[^a-zA-Z0-9._-]", "-", base)
+    base = re.sub(r"-+", "-", base).strip("-")
+    return base or ""
+
+
+def get_run_id() -> Optional[str]:
+    raw = os.environ.get(RUN_ID_ENV, "").strip()
+    if not raw:
+        return None
+    safe = normalize_filename_fragment(raw)
+    return safe or None
+
+
 def build_default_token_file(email: Optional[str] = None) -> str:
     data_dir = os.path.join(os.getcwd(), "data")
     os.makedirs(data_dir, exist_ok=True)
@@ -577,6 +604,10 @@ def build_default_token_file(email: Optional[str] = None) -> str:
     else:
         ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
         filename = f"kiro_refresh_token_bundle_{ts}.json"
+    run_id = get_run_id()
+    if run_id:
+        name, ext = os.path.splitext(filename)
+        filename = f"{name}__{run_id}{ext}"
     return os.path.join(data_dir, filename)
 
 
@@ -585,6 +616,13 @@ def build_mail_output_file(token_file: str) -> str:
     if not ext:
         ext = ".json"
     return f"{base}_mail{ext}"
+
+
+def build_result_output_file(token_file: str) -> str:
+    base, ext = os.path.splitext(token_file)
+    if not ext:
+        ext = ".json"
+    return f"{base}_result{ext}"
 
 
 def save_json_file(path: str, data: Any) -> None:
@@ -1582,7 +1620,7 @@ def _flatten_query(qs: dict[str, list[str]]) -> dict[str, str]:
 
 def make_handler(shared: CallbackState, success_redirect_url: str):
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, fmt: str, *args):  # noqa: D401
+        def log_message(self, format: str, *args):  # noqa: D401
             return
 
         def _write_302(self) -> None:
@@ -1803,7 +1841,7 @@ def main() -> None:
     should_exchange_token = config.exchange_token
     token_file = build_default_token_file()
     mail_file: Optional[str] = None
-    port = config.callback_port or first_available_port(APP_CONFIG.callback_ports)
+    port = config.callback_port or ensure_available_port(APP_CONFIG.callback_ports)
     token_output: Optional[list[dict[str, str]]] = None
 
     # 第一阶段参数（Portal /signin + InitiateLogin）
@@ -2100,6 +2138,36 @@ def main() -> None:
                 )
                 final["token_output"] = token_output
                 log("token 交换成功，已提取 refreshToken / clientId / clientSecret")
+
+                if config.verify_credential:
+                    access_token = str(token_resp.get("accessToken", "") or "")
+                    profile_arn = resolve_profile_arn(config.profile_arn, login_option)
+                    if not access_token:
+                        final["credential_verify"] = {
+                            "status": "unknown",
+                            "reason": "missing_access_token",
+                        }
+                        log("校验跳过：token 响应缺少 accessToken")
+                    elif not profile_arn:
+                        final["credential_verify"] = {
+                            "status": "unknown",
+                            "reason": "missing_profile_arn",
+                        }
+                        log("校验跳过：未提供 profileArn，且未匹配默认值")
+                    else:
+                        verify = verify_bearer_credential(
+                            session=session,
+                            authorization_header=f"Bearer {access_token}",
+                            idc_region=idc_region,
+                            profile_arn=profile_arn,
+                        )
+                        is_valid = bool(verify.get("is_valid_for_kiro_q"))
+                        status = "ok" if is_valid else "blocked_or_invalid"
+                        final["credential_verify"] = {
+                            "status": status,
+                            "detail": verify,
+                        }
+                        log(f"账号验证结果：{status}")
             elif not should_exchange_token:
                 log("当前配置已禁用 token 交换")
 
@@ -2139,6 +2207,10 @@ def main() -> None:
                 save_json_file(mail_file, mail_payload)
                 final["shortmail_file"] = mail_file
                 log(f"临时邮箱文件已保存：{mail_file}")
+            result_file = build_result_output_file(token_file)
+            save_json_file(result_file, final)
+            final["result_file"] = result_file
+            log(f"完整结果文件已保存：{result_file}")
         except Exception as save_err:
             final["save_error"] = str(save_err)
             log(f"保存最终 token 文件失败：{save_err}")

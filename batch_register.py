@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+批量并发执行 kiro_full_flow_cn.py，并汇总注册结果。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
+
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def log(msg: str) -> None:
+    print(f"[{now_str()}] {msg}")
+
+
+def normalize_run_id(value: str) -> str:
+    base = value.strip()
+    base = re.sub(r"[^a-zA-Z0-9._-]", "-", base)
+    base = re.sub(r"-+", "-", base).strip("-")
+    return base or "run"
+
+
+def extract_result_file(output: str) -> str | None:
+    pattern = re.compile(r"完整结果文件已保存：(.+)$", re.MULTILINE)
+    match = pattern.search(output)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def load_json(path: str) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def classify_result(result_json: dict[str, Any]) -> dict[str, str]:
+    verify = result_json.get("credential_verify")
+    if isinstance(verify, dict):
+        status = str(verify.get("status", "unknown") or "unknown")
+    else:
+        status = "unknown"
+
+    if status == "ok":
+        return {"status": "ok"}
+    if status == "blocked_or_invalid":
+        return {"status": "blocked"}
+    if "error" in result_json:
+        return {"status": "failed"}
+    return {"status": "unknown"}
+
+
+def run_one(
+    run_id: str,
+    idx: int,
+    python_exe: str,
+    script_path: str,
+    env: dict[str, str],
+    lock: threading.Lock,
+) -> dict[str, Any]:
+    tag = f"{run_id}-{idx}"
+    log(f"开始任务 {tag}")
+    job_env = dict(env)
+    job_env["KIRO_RUN_ID"] = tag
+    try:
+        completed = subprocess.run(
+            [python_exe, script_path],
+            env=job_env,
+            capture_output=True,
+            text=True,
+            timeout=None,
+        )
+        output = "".join([completed.stdout or "", completed.stderr or ""])
+    except Exception as e:
+        return {"id": tag, "status": "failed", "error": str(e)}
+
+    result_file = extract_result_file(output)
+    if result_file and os.path.exists(result_file):
+        result_json = load_json(result_file)
+        classification = classify_result(result_json)
+        return {
+            "id": tag,
+            "status": classification["status"],
+            "result_file": result_file,
+        }
+
+    with lock:
+        log(f"任务 {tag} 未找到结果文件，标记为 failed")
+    return {"id": tag, "status": "failed"}
+
+
+def print_table(rows: list[dict[str, Any]]) -> None:
+    total = len(rows)
+    blocked = sum(1 for r in rows if r.get("status") == "blocked")
+    ok = sum(1 for r in rows if r.get("status") == "ok")
+    failed = sum(1 for r in rows if r.get("status") == "failed")
+    unknown = sum(1 for r in rows if r.get("status") == "unknown")
+
+    header = ["total", "ok", "blocked", "failed", "unknown"]
+    values = [str(total), str(ok), str(blocked), str(failed), str(unknown)]
+    widths = [max(len(h), len(v)) for h, v in zip(header, values)]
+
+    line = " | ".join(h.ljust(w) for h, w in zip(header, widths))
+    sep = "-+-".join("-" * w for w in widths)
+    val = " | ".join(v.ljust(w) for v, w in zip(values, widths))
+
+    print("\n结果汇总")
+    print(line)
+    print(sep)
+    print(val)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--count", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--python", default="python3")
+    parser.add_argument(
+        "--script",
+        default=os.path.join(os.getcwd(), "kiro_full_flow_cn.py"),
+    )
+    parser.add_argument("--run-id", default="batch")
+    args = parser.parse_args()
+
+    if args.count < 1:
+        raise SystemExit("--count 必须 >= 1")
+    if args.workers < 1:
+        raise SystemExit("--workers 必须 >= 1")
+
+    run_id = normalize_run_id(args.run_id)
+    env = os.environ.copy()
+    lock = threading.Lock()
+
+    rows: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = [
+            executor.submit(
+                run_one,
+                run_id,
+                idx + 1,
+                args.python,
+                args.script,
+                env,
+                lock,
+            )
+            for idx in range(args.count)
+        ]
+        for fut in as_completed(futures):
+            rows.append(fut.result())
+
+    print_table(rows)
+
+
+if __name__ == "__main__":
+    main()
