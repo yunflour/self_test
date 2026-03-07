@@ -2255,9 +2255,7 @@ def main() -> None:
                         "token 响应未返回 refreshToken，无法生成最终文件"
                     )
                 access_token = str(token_resp.get("accessToken", "") or "")
-                resolved_profile_arn = resolve_profile_arn(
-                    config.profile_arn, login_option
-                ) or ""
+                resolved_profile_arn = ""
                 temp_email = (
                     camoufox_session.temp_email
                     if camoufox_session is not None
