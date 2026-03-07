@@ -315,20 +315,27 @@ def _shortmail_headers(token: Optional[str] = None) -> dict[str, str]:
 
 
 def create_short_email(
-    max_retries: int = 5, retry_sleep_s: float = 2.5
+    username: Optional[str] = None,
+    max_retries: int = 5,
+    retry_sleep_s: float = 2.5,
 ) -> tuple[str, str, str]:
     """
     创建短效邮箱，返回 (email, jwt, password)。
     适配 DuckMail: POST /accounts + POST /token
+
+    如果传入 username，则使用该用户名；否则随机生成 10 位用户名。
     """
     shortmail = APP_CONFIG.shortmail
     last_err: Optional[Exception] = None
     for _ in range(max_retries):
         try:
-            username = "".join(
-                random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=10)
-            )
-            email = f"{username}@{shortmail.domain}"
+            if username is None:
+                _uname = "".join(
+                    random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=10)
+                )
+            else:
+                _uname = username
+            email = f"{_uname}@{shortmail.domain}"
             password = generate_strong_password()
 
             resp = requests.post(
@@ -492,6 +499,78 @@ def generate_random_english_name() -> str:
     return f"{first} {last}"
 
 
+_NAME_POOL: Optional[list[tuple[str, str]]] = None
+
+
+def load_name_pool() -> list[tuple[str, str]]:
+    """
+    从 config/name.txt 加载姓名库，返回 [(first_name, last_name), ...]。
+    跳过空行和只有 first name 没有 last name 的行。
+    """
+    global _NAME_POOL
+    if _NAME_POOL is not None:
+        return _NAME_POOL
+
+    name_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "name.txt")
+    if not os.path.isfile(name_file):
+        log(f"姓名库文件不存在：{name_file}，将使用随机生成")
+        _NAME_POOL = []
+        return _NAME_POOL
+
+    pool: list[tuple[str, str]] = []
+    with open(name_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                # 跳过只有 first name 的行（如 "Felix"）
+                continue
+            first_name, last_name = parts[0], parts[1]
+            pool.append((first_name, last_name))
+
+    _NAME_POOL = pool
+    log(f"姓名库已加载：共 {len(pool)} 条记录")
+    return _NAME_POOL
+
+
+def _sanitize_for_email(name: str) -> str:
+    """
+    将姓名中的特殊字符移除，只保留英文字母，并转为小写。
+    例如："O'Connor" -> "oconnor"，"Lou(ie)" -> "louie"，"Burne-Jones" -> "burnejones"
+    """
+    return re.sub(r"[^a-zA-Z]", "", name).lower()
+
+
+def pick_name_from_pool() -> tuple[str, str]:
+    """
+    从姓名库随机选取一条记录，返回 (full_name, email_username)。
+    - full_name: 原始全名，如 "Jacob Harrod"
+    - email_username: lastnameNN 格式，如 "harrod42"
+
+    如果姓名库为空或不可用，则回退到 generate_random_english_name()。
+    """
+    pool = load_name_pool()
+    if not pool:
+        fallback_name = generate_random_english_name()
+        parts = fallback_name.split()
+        last = parts[-1] if len(parts) > 1 else parts[0]
+        nn = random.randint(1, 99)
+        return fallback_name, f"{last.lower()}{nn:02d}"
+
+    first_name, last_name = random.choice(pool)
+    full_name = f"{first_name} {last_name}"
+    sanitized_last = _sanitize_for_email(last_name)
+    if not sanitized_last:
+        sanitized_last = _sanitize_for_email(first_name)
+    if not sanitized_last:
+        sanitized_last = "user"
+    nn = random.randint(1, 99)
+    email_username = f"{sanitized_last}{nn:02d}"
+    return full_name, email_username
+
+
 def generate_strong_password(length: int = 12) -> str:
     """
     生成满足 Builder ID 密码策略的随机密码：
@@ -635,20 +714,43 @@ def save_json_file(path: str, data: Any) -> None:
 
 def build_refresh_token_bundle(
     refresh_token: str,
+    access_token: str,
     client_id: str,
     client_secret: str,
-    auth_region: str,
-    api_region: str,
-) -> list[dict[str, str]]:
-    return [
-        {
-            "refreshToken": refresh_token,
-            "clientId": client_id,
-            "clientSecret": client_secret,
-            "authRegion": auth_region,
-            "apiRegion": api_region,
-        }
-    ]
+    region: str,
+    email: str = "",
+    profile_arn: str = "",
+    start_url: str = "https://view.awsapps.com/start",
+) -> dict[str, Any]:
+    now = time.localtime()
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", now)
+    # 计算本地 UTC 偏移，格式如 +08:00
+    utc_offset = time.strftime("%z", now)
+    if len(utc_offset) == 5:  # e.g. "+0800"
+        utc_offset = utc_offset[:3] + ":" + utc_offset[3:]
+    now_iso += utc_offset
+    # expires_at = 当前时间 + 1 小时
+    expires_ts = time.mktime(now) + 3600
+    expires_local = time.localtime(expires_ts)
+    expires_iso = time.strftime("%Y-%m-%dT%H:%M:%S", expires_local)
+    expires_iso += utc_offset
+
+    return {
+        "access_token": access_token,
+        "auth_method": "builder-id",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "disabled": False,
+        "email": email,
+        "expires_at": expires_iso,
+        "last_refresh": now_iso,
+        "profile_arn": profile_arn,
+        "provider": "AWS",
+        "refresh_token": refresh_token,
+        "region": region,
+        "start_url": start_url,
+        "type": "kiro",
+    }
 
 
 class CamoufoxSession:
@@ -753,9 +855,12 @@ class CamoufoxSession:
                     # 用户反馈按钮点击过早，这里显式多等一段时间让页面脚本和动画稳定。
                     await page.wait_for_timeout(random.randint(2600, 4200))
 
-                    self._trace("申请短效邮箱中")
+                    self._trace("从姓名库选取姓名并申请短效邮箱")
+                    picked_full_name, picked_email_username = pick_name_from_pool()
+                    self.generated_full_name = picked_full_name
+                    self._trace(f"选取姓名: {picked_full_name}, 邮箱用户名: {picked_email_username}")
                     email, jwt, temp_password = await asyncio.to_thread(
-                        create_short_email
+                        create_short_email, username=picked_email_username
                     )
                     self.temp_email = email
                     self.temp_email_jwt = jwt
@@ -968,7 +1073,7 @@ class CamoufoxSession:
                             name_input_selector, state="visible", timeout=60000
                         )
                         self._trace("检测到姓名输入页，开始自动填充姓名")
-                        full_name = generate_random_english_name()
+                        full_name = self.generated_full_name or generate_random_english_name()
                         self.generated_full_name = full_name
 
                         name_input = page.locator(name_input_selector).first
@@ -1842,7 +1947,7 @@ def main() -> None:
     token_file = build_default_token_file()
     mail_file: Optional[str] = None
     port = config.callback_port or ensure_available_port(APP_CONFIG.callback_ports)
-    token_output: Optional[list[dict[str, str]]] = None
+    token_output: Optional[dict[str, Any]] = None
 
     # 第一阶段参数（Portal /signin + InitiateLogin）
     stage1_state = str(uuid.uuid4())
@@ -2129,15 +2234,27 @@ def main() -> None:
                     raise RuntimeError(
                         "token 响应未返回 refreshToken，无法生成最终文件"
                     )
+                access_token = str(token_resp.get("accessToken", "") or "")
+                resolved_profile_arn = resolve_profile_arn(
+                    config.profile_arn, login_option
+                ) or ""
+                temp_email = (
+                    camoufox_session.temp_email
+                    if camoufox_session is not None
+                    else ""
+                ) or ""
                 token_output = build_refresh_token_bundle(
                     refresh_token=refresh_token,
+                    access_token=access_token,
                     client_id=str(client_id),
                     client_secret=str(client_secret),
-                    auth_region=APP_CONFIG.token_output.auth_region,
-                    api_region=APP_CONFIG.token_output.api_region,
+                    region=idc_region,
+                    email=temp_email,
+                    profile_arn=resolved_profile_arn,
+                    start_url=config.start_url or "https://view.awsapps.com/start",
                 )
                 final["token_output"] = token_output
-                log("token 交换成功，已提取 refreshToken / clientId / clientSecret")
+                log("token 交换成功，已生成完整凭据文件")
 
                 if config.verify_credential:
                     access_token = str(token_resp.get("accessToken", "") or "")
