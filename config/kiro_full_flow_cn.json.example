@@ -1,0 +1,61 @@
+{
+  "flow": {
+    "portalUrl": "https://app.kiro.dev",
+    "idp": "BuilderId",
+    "startUrl": "https://view.awsapps.com/start",
+    "idcRegion": "us-east-1",
+    "redirectFrom": "KiroIDE",
+    "registerRedirectUri": "http://127.0.0.1/oauth/callback",
+    "timeoutSeconds": 600,
+    "openBrowser": true,
+    "exchangeToken": true,
+    "verifyCredential": true,
+    "profileArn": "",
+    "browser": "camoufox",
+    "camoufoxHeadless": false,
+    "camoufoxOs": "auto",
+    "camoufoxStartupTimeoutSeconds": null,
+    "camoufoxAutofillEmail": true,
+    "saveResult": true,
+    "outputJson": false,
+    "callbackPort": null
+  },
+  "callbackPorts": [
+    3128,
+    4649,
+    6588,
+    8008,
+    9091,
+    49153,
+    50153,
+    51153,
+    52153,
+    53153
+  ],
+  "initiateLoginPath": "/service/KiroWebPortalService/operation/InitiateLogin",
+  "kiroGrantScopes": [
+    "codewhisperer:completions",
+    "codewhisperer:analysis",
+    "codewhisperer:conversations",
+    "codewhisperer:transformations",
+    "codewhisperer:taskassist"
+  ],
+  "fixedProfileArns": {
+    "builderid": "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX",
+    "google": "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK",
+    "github": "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+  },
+  "passwordSymbols": "!@#$%^&*()-_=+[]{}:,.?",
+  "shortmail": {
+    "baseUrl": "https://temp-mail.xxxxx.workers.dev", //邮箱服务器域名
+    "origin": "https://xxxxx.xxxxx.workers.dev",
+    "bootstrapToken": "Toekn", //邮箱Token
+    "domain": "xxxx.com", //域名
+    "fingerprint": "299edca5955a3aec40b45fda12778cc9", //固定就行 无所谓
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+  },
+  "tokenOutput": {
+    "authRegion": "us-east-1",
+    "apiRegion": "us-west-2"
+  }
+}
