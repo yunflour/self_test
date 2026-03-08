@@ -225,19 +225,22 @@ def main() -> None:
 
     rows: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = [
-            executor.submit(
-                run_one,
-                run_id,
-                idx + 1,
-                args.count,
-                args.python,
-                args.script,
-                env,
-                lock,
+        futures = []
+        for idx in range(args.count):
+            futures.append(
+                executor.submit(
+                    run_one,
+                    run_id,
+                    idx + 1,
+                    args.count,
+                    args.python,
+                    args.script,
+                    env,
+                    lock,
+                )
             )
-            for idx in range(args.count)
-        ]
+            if idx < args.count - 1:
+                time.sleep(1)
         for fut in as_completed(futures):
             rows.append(fut.result())
 
