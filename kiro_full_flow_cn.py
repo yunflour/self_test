@@ -73,9 +73,10 @@ class FlowConfig:
 
 @dataclass(frozen=True)
 class ShortmailConfig:
+    api_url: str
     base_url: str
     origin: str
-    bootstrap_token: str
+    admin_key: str
     domain: str
     fingerprint: str
     user_agent: str
@@ -175,13 +176,19 @@ def load_app_config() -> AppConfig:
     }
 
     shortmail = ShortmailConfig(
+        api_url=str(shortmail_raw.get("api", {}).get("url", "duckmail")).strip().lower() or "duckmail",
         base_url=str(_require_key(shortmail_raw, "baseUrl", str)),
         origin=str(_require_key(shortmail_raw, "origin", str)),
-        bootstrap_token=str(_require_key(shortmail_raw, "bootstrapToken", str)),
+        admin_key=str(shortmail_raw.get("adminkey", "")),
         domain=str(_require_key(shortmail_raw, "domain", str)),
         fingerprint=str(_require_key(shortmail_raw, "fingerprint", str)),
         user_agent=str(_require_key(shortmail_raw, "userAgent", str)),
     )
+
+    if shortmail.api_url not in {"duckmail", "tempmail"}:
+        raise RuntimeError("shortmail.api.url 仅支持 duckmail 或 tempmail")
+    if not shortmail.admin_key:
+        raise RuntimeError("shortmail.adminkey 不能为空")
 
     token_output = TokenOutputConfig(
         auth_region=str(_require_key(token_output_raw, "authRegion", str)),
@@ -287,7 +294,7 @@ def mask_secret(value: str, head: int = 16, tail: int = 8) -> str:
     return f"{value[:head]}...{value[-tail:]}"
 
 
-def _shortmail_headers(token: Optional[str] = None) -> dict[str, str]:
+def _shortmail_headers(token: Optional[str] = None, admin_key: Optional[str] = None) -> dict[str, str]:
     shortmail = APP_CONFIG.shortmail
     headers = {
         "accept": "application/json, text/plain, */*",
@@ -313,6 +320,8 @@ def _shortmail_headers(token: Optional[str] = None) -> dict[str, str]:
     }
     if token:
         headers["authorization"] = f"Bearer {token}"
+    if admin_key:
+        headers["x-admin-auth"] = admin_key
     return headers
 
 
@@ -323,12 +332,43 @@ def create_short_email(
 ) -> tuple[str, str, str]:
     """
     创建短效邮箱，返回 (email, jwt, password)。
-    适配 DuckMail: POST /accounts + POST /token
+    - duckmail: POST /accounts + POST /token
+    - tempmail: POST /admin/new_address
 
     如果传入 username，则使用该用户名；否则随机生成 10 位用户名。
     """
     shortmail = APP_CONFIG.shortmail
     last_err: Optional[Exception] = None
+    if shortmail.api_url == "tempmail":
+        for _ in range(max_retries):
+            try:
+                if username is None:
+                    _uname = "".join(
+                        random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=10)
+                    )
+                else:
+                    _uname = username
+                resp = requests.post(
+                    f"{shortmail.base_url}/admin/new_address",
+                    json={"name": _uname, "domain": shortmail.domain, "enablePrefix": True},
+                    headers=_shortmail_headers(admin_key=shortmail.admin_key),
+                    timeout=30,
+                )
+                if resp.status_code == 409:
+                    raise RuntimeError("邮箱地址已存在")
+                resp.raise_for_status()
+                data = resp.json()
+                email = str(data.get("address", "") or "")
+                jwt = str(data.get("jwt", "") or "")
+                if not email or not jwt:
+                    raise RuntimeError("短效邮箱接口返回缺少 address/jwt")
+                # tempmail 管理接口不会返回明文密码
+                return email, jwt, ""
+            except Exception as e:
+                last_err = e
+                time.sleep(retry_sleep_s)
+        raise RuntimeError(f"短效邮箱创建失败（已重试 {max_retries} 次）：{last_err}")
+
     for _ in range(max_retries):
         try:
             if username is None:
@@ -343,7 +383,7 @@ def create_short_email(
             resp = requests.post(
                 f"{shortmail.base_url}/accounts",
                 json={"address": email, "password": password},
-                headers=_shortmail_headers(shortmail.bootstrap_token),
+                headers=_shortmail_headers(shortmail.admin_key),
                 timeout=30,
             )
             if resp.status_code == 409:
@@ -381,9 +421,23 @@ def _duckmail_message_raw(detail: dict[str, Any]) -> str:
 def fetch_shortmail_mails(jwt: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
     """
     获取短效邮箱邮件列表。
-    适配 DuckMail: GET /messages + GET /messages/{id}
+    - duckmail: GET /messages + GET /messages/{id}
+    - tempmail: GET /api/mails
     """
     shortmail = APP_CONFIG.shortmail
+    if shortmail.api_url == "tempmail":
+        resp = requests.get(
+            f"{shortmail.base_url}/api/mails",
+            params={"limit": limit, "offset": offset},
+            headers=_shortmail_headers(jwt),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict):
+            return data
+        return {"raw": data}
+
     resp = requests.get(
         f"{shortmail.base_url}/messages",
         params={"page": max(1, int(offset / max(1, limit)) + 1)},
