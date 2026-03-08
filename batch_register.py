@@ -14,7 +14,12 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Any
+
+# 全局日志文件路径和锁
+_log_file_path: str | None = None
+_log_lock = threading.Lock()
 
 
 def now_str() -> str:
@@ -22,7 +27,13 @@ def now_str() -> str:
 
 
 def log(msg: str) -> None:
-    print(f"[{now_str()}] {msg}")
+    """打印日志到控制台，同时写入log文件"""
+    log_line = f"[{now_str()}] {msg}"
+    print(log_line)
+    if _log_file_path:
+        with _log_lock:
+            with open(_log_file_path, "a", encoding="utf-8") as f:
+                f.write(log_line + "\n")
 
 
 def normalize_run_id(value: str) -> str:
@@ -65,13 +76,14 @@ def classify_result(result_json: dict[str, Any]) -> dict[str, str]:
 def run_one(
     run_id: str,
     idx: int,
+    total: int,
     python_exe: str,
     script_path: str,
     env: dict[str, str],
     lock: threading.Lock,
 ) -> dict[str, Any]:
     tag = f"{run_id}-{idx}"
-    log(f"开始任务 {tag}")
+    log(f"[{idx}/{total}] 开始任务 {tag}")
     job_env = dict(env)
     job_env["KIRO_RUN_ID"] = tag
     try:
@@ -84,6 +96,7 @@ def run_one(
         )
         output = "".join([completed.stdout or "", completed.stderr or ""])
     except Exception as e:
+        log(f"[{idx}/{total}] 任务 {tag} 执行异常: {e}")
         return {"id": tag, "status": "failed", "error": str(e)}
 
     result_file = extract_result_file(output)
@@ -95,16 +108,18 @@ def run_one(
         token_output = result_json.get("token_output")
         if isinstance(token_output, dict):
             email = token_output.get("email", "")
+        status = classification["status"]
+        log(f"[{idx}/{total}] 任务 {tag} 完成: status={status}, email={email}")
         return {
             "id": tag,
-            "status": classification["status"],
+            "status": status,
             "result_file": result_file,
             "token_file": token_file,
             "email": email,
         }
 
     with lock:
-        log(f"任务 {tag} 未找到结果文件，标记为 failed")
+        log(f"[{idx}/{total}] 任务 {tag} 未找到结果文件，标记为 failed")
     return {"id": tag, "status": "failed"}
 
 
@@ -176,6 +191,8 @@ def collect_success_files(rows: list[dict[str, Any]], run_id: str) -> str:
 
 
 def main() -> None:
+    global _log_file_path
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--count", type=int, default=1)
     parser.add_argument("--workers", type=int, default=1)
@@ -196,7 +213,14 @@ def main() -> None:
     env = os.environ.copy()
     lock = threading.Lock()
 
+    # 创建data目录和log文件
+    data_dir = os.path.join(os.getcwd(), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    log_filename = datetime.now().strftime("%Y%m%d_%H%M%S") + ".log"
+    _log_file_path = os.path.join(data_dir, log_filename)
+
     log(f"批量注册开始: count={args.count}, workers={args.workers}, run-id={run_id}")
+    log(f"日志文件: {_log_file_path}")
     start_time = time.time()
 
     rows: list[dict[str, Any]] = []
@@ -206,6 +230,7 @@ def main() -> None:
                 run_one,
                 run_id,
                 idx + 1,
+                args.count,
                 args.python,
                 args.script,
                 env,
