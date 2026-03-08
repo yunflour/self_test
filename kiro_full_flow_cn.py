@@ -1237,12 +1237,7 @@ class CamoufoxSession:
                                     3.0,
                                 )
                                 self.shortmail_first_mail_json = mail_json
-                                log("SHORTMAIL_MAIL_JSON_BEGIN")
-                                print(
-                                    json.dumps(mail_json, ensure_ascii=False, indent=2)
-                                )
-                                log("SHORTMAIL_MAIL_JSON_END")
-                                self._trace("邮件原始 JSON 已打印，开始提取验证码")
+                                self._trace("邮件 JSON 已获取，开始提取验证码")
 
                                 verification_code = (
                                     extract_verification_code_from_shortmail_json(
@@ -2050,7 +2045,6 @@ def main() -> None:
             start_url=config.start_url,
         )
         final["stage1"]["initiate_login_response"] = initiate_resp
-        log(f"InitiateLogin 返回：{json.dumps(initiate_resp, ensure_ascii=False)}")
 
         redirect_url = initiate_resp.get("redirectUrl")
         if not redirect_url:
