@@ -809,6 +809,56 @@ def build_refresh_token_bundle(
     }
 
 
+async def random_trajectory_click(page, locator, trace_func=None, timeout=10000):
+    box = None
+    try:
+        box = await locator.bounding_box(timeout=0)
+    except Exception as box_err:
+        if trace_func:
+            trace_func(f"读取按钮坐标失败，转回退点击路径: {box_err}")
+
+    click_sent = False
+    if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+        cx = box["x"] + box["width"] / 2
+        cy = box["y"] + box["height"] / 2
+        jx = random.uniform(-min(8.0, box["width"] / 5), min(8.0, box["width"] / 5))
+        jy = random.uniform(-min(6.0, box["height"] / 5), min(6.0, box["height"] / 5))
+        tx = max(1.0, cx + jx)
+        ty = max(1.0, cy + jy)
+
+        sx = max(1.0, tx + random.uniform(-180, -70))
+        sy = max(1.0, ty + random.uniform(-90, 90))
+        await page.mouse.move(sx, sy)
+        await page.wait_for_timeout(random.randint(90, 220))
+
+        steps = random.randint(4, 7)
+        for step in range(1, steps + 1):
+            ratio = step / steps
+            mx = sx + (tx - sx) * ratio + random.uniform(-1.8, 1.8)
+            my = sy + (ty - sy) * ratio + random.uniform(-1.2, 1.2)
+            await page.mouse.move(mx, my)
+            await page.wait_for_timeout(random.randint(45, 110))
+
+        await page.mouse.move(tx, ty)
+        await page.wait_for_timeout(random.randint(70, 180))
+        await page.mouse.down()
+        await page.wait_for_timeout(random.randint(45, 140))
+        await page.mouse.up()
+        click_sent = True
+        if trace_func:
+            trace_func("按钮已通过鼠标轨迹点击")
+    else:
+        try:
+            await locator.click(timeout=timeout)
+            click_sent = True
+            if trace_func:
+                trace_func("按钮已通过 locator.click 点击")
+        except Exception as click_err:
+            raise RuntimeError(f"按钮单次点击失败：{click_err}") from click_err
+            
+    return click_sent
+
+
 class CamoufoxSession:
     """
     在后台线程中托管 AsyncCamoufox 生命周期，便于主流程继续等待本地回调。
@@ -1006,56 +1056,8 @@ class CamoufoxSession:
                         }}"""
                     )
 
-                    click_sent = False
                     self._trace("邮箱页 Continue 只点击一次，不重试")
-                    box = None
-                    try:
-                        box = await continue_btn.bounding_box(timeout=0)
-                    except Exception as box_err:
-                        self._trace(
-                            f"读取 Continue 坐标失败，转回退点击路径: {box_err}"
-                        )
-                    if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
-                        cx = box["x"] + box["width"] / 2
-                        cy = box["y"] + box["height"] / 2
-                        jx = random.uniform(
-                            -min(8.0, box["width"] / 5), min(8.0, box["width"] / 5)
-                        )
-                        jy = random.uniform(
-                            -min(6.0, box["height"] / 5), min(6.0, box["height"] / 5)
-                        )
-                        tx = max(1.0, cx + jx)
-                        ty = max(1.0, cy + jy)
-
-                        sx = max(1.0, tx + random.uniform(-180, -70))
-                        sy = max(1.0, ty + random.uniform(-90, 90))
-                        await page.mouse.move(sx, sy)
-                        await page.wait_for_timeout(random.randint(90, 220))
-
-                        steps = random.randint(4, 7)
-                        for step in range(1, steps + 1):
-                            ratio = step / steps
-                            mx = sx + (tx - sx) * ratio + random.uniform(-1.8, 1.8)
-                            my = sy + (ty - sy) * ratio + random.uniform(-1.2, 1.2)
-                            await page.mouse.move(mx, my)
-                            await page.wait_for_timeout(random.randint(45, 110))
-
-                        await continue_btn.hover()
-                        await page.wait_for_timeout(random.randint(70, 180))
-                        await page.mouse.down()
-                        await page.wait_for_timeout(random.randint(45, 140))
-                        await page.mouse.up()
-                        click_sent = True
-                        self._trace("Continue 已通过鼠标轨迹点击")
-                    else:
-                        try:
-                            await continue_btn.click(timeout=10000)
-                            click_sent = True
-                            self._trace("Continue 已通过 locator.click 点击")
-                        except Exception as click_err:
-                            raise RuntimeError(
-                                f"Continue 单次点击失败：{click_err}"
-                            ) from click_err
+                    click_sent = await random_trajectory_click(page, continue_btn, self._trace, timeout=10000)
 
                     if not click_sent:
                         raise RuntimeError("Continue 点击动作未执行成功")
@@ -1168,42 +1170,22 @@ class CamoufoxSession:
                         for _ in range(3):
                             self._trace(f"姓名页 Continue 点击尝试 {_ + 1}/3")
                             try:
-                                await name_continue_btn.click(timeout=9000)
-                                name_submitted = True
-                                self._trace("姓名页 Continue 已通过 locator.click 点击")
-                                break
+                                await random_trajectory_click(page, name_continue_btn, self._trace, timeout=9000)
                             except Exception:
                                 pass
-                            try:
-                                await name_input.press("Enter")
+                                
+                            await page.wait_for_timeout(2000)
+                            if await name_continue_btn.is_visible():
+                                try:
+                                    await name_input.press("Enter")
+                                    self._trace("姓名页 Continue 已通过 Enter 提交")
+                                except Exception:
+                                    pass
+                                    
+                            await page.wait_for_timeout(1000)
+                            if not await name_continue_btn.is_visible():
                                 name_submitted = True
-                                self._trace("姓名页 Continue 已通过 Enter 提交")
                                 break
-                            except Exception:
-                                pass
-                            try:
-                                await name_continue_btn.evaluate(
-                                    """(btn) => {
-                                        const f = btn.closest('form');
-                                        if (f && typeof f.requestSubmit === 'function') {
-                                            f.requestSubmit();
-                                            return;
-                                        }
-                                        if (f) {
-                                            f.submit();
-                                            return;
-                                        }
-                                        btn.click();
-                                    }"""
-                                )
-                                name_submitted = True
-                                self._trace(
-                                    "姓名页 Continue 已通过 requestSubmit/submit 提交"
-                                )
-                                break
-                            except Exception:
-                                pass
-                            await page.wait_for_timeout(random.randint(300, 700))
 
                         if not name_submitted:
                             raise RuntimeError("姓名页 Continue 点击失败")
@@ -1236,8 +1218,8 @@ class CamoufoxSession:
                         )
                         verify_page_detected = True
                         self._trace("已进入邮箱验证码页")
-                    except Exception:
-                        self._trace("未检测到邮箱验证码页，跳过短效邮箱拉取")
+                    except Exception as verify_err:
+                        self._trace(f"未检测到邮箱验证码页，跳过短效邮箱拉取: {verify_err}")
 
                     if verify_page_detected:
                         if not self.temp_email_jwt:
@@ -1310,25 +1292,23 @@ class CamoufoxSession:
 
                                 verify_clicked = False
                                 try:
-                                    await verify_btn.click(timeout=15000)
-                                    verify_clicked = True
-                                    self._trace("验证码页 Continue 点击成功")
+                                    await random_trajectory_click(page, verify_btn, self._trace, timeout=15000)
                                 except Exception as verify_click_err:
                                     self._trace(
-                                        f"验证码页 Continue click 失败，尝试 Enter: {verify_click_err}"
+                                        f"验证码页 Continue hover/click 失败: {verify_click_err}"
                                     )
 
-                                if not verify_clicked:
+                                await page.wait_for_timeout(2500)
+                                if await verify_btn.is_visible():
                                     try:
                                         await code_input.press("Enter")
-                                        verify_clicked = True
                                         self._trace(
                                             "验证码页 Continue 已通过 Enter 提交"
                                         )
                                     except Exception as verify_enter_err:
-                                        raise RuntimeError(
-                                            f"验证码页 Continue 提交失败（click/Enter）：{verify_enter_err}"
-                                        ) from verify_enter_err
+                                        self._trace(f"验证码页 Enter 失败: {verify_enter_err}")
+                                
+                                verify_clicked = True
 
                                 self.verification_code_submitted = verify_clicked
 
@@ -1426,25 +1406,23 @@ class CamoufoxSession:
 
                                     pwd_submitted = False
                                     try:
-                                        await pwd_continue_btn.click(timeout=20000)
-                                        pwd_submitted = True
-                                        self._trace("密码页 Continue 点击成功")
+                                        await random_trajectory_click(page, pwd_continue_btn, self._trace, timeout=20000)
                                     except Exception as pwd_click_err:
                                         self._trace(
-                                            f"密码页 Continue click 失败，尝试 Enter: {pwd_click_err}"
+                                            f"密码页 Continue hover/click 失败: {pwd_click_err}"
                                         )
 
-                                    if not pwd_submitted:
+                                    await page.wait_for_timeout(2500)
+                                    if await pwd_continue_btn.is_visible():
                                         try:
                                             await repwd_input.press("Enter")
-                                            pwd_submitted = True
                                             self._trace(
                                                 "密码页 Continue 已通过 Enter 提交"
                                             )
                                         except Exception as pwd_enter_err:
-                                            raise RuntimeError(
-                                                f"密码页 Continue 提交失败（click/Enter）：{pwd_enter_err}"
-                                            ) from pwd_enter_err
+                                            self._trace(f"密码页 Enter 失败: {pwd_enter_err}")
+                                            
+                                    pwd_submitted = True
 
                                     self.password_submitted = pwd_submitted
 
@@ -1472,7 +1450,7 @@ class CamoufoxSession:
                                         await page.wait_for_timeout(
                                             random.randint(400, 900)
                                         )
-                                        await allow_btn.click(timeout=20000)
+                                        await random_trajectory_click(page, allow_btn, self._trace, timeout=20000)
                                         self.allow_access_clicked = True
                                         self._trace(
                                             "Allow access 点击成功，注册流程收尾完成"
