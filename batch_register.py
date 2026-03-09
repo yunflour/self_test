@@ -17,9 +17,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
+import requests
+
 # 全局日志文件路径和锁
 _log_file_path: str | None = None
 _log_lock = threading.Lock()
+
+# 发卡平台配置（全局）
+_faka_url: str | None = None
+_faka_username: str | None = None
+_faka_password: str | None = None
+_faka_session: requests.Session | None = None
 
 
 def now_str() -> str:
@@ -55,6 +63,89 @@ def load_json(path: str) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return data if isinstance(data, dict) else {}
+
+
+def faka_login() -> requests.Session | None:
+    """登录发卡平台，返回已认证的 session"""
+    global _faka_session
+    if not _faka_url or not _faka_username or not _faka_password:
+        return None
+    if _faka_session:
+        return _faka_session
+    try:
+        session = requests.Session()
+        login_url = f"{_faka_url.rstrip('/')}/admin/login"
+        resp = session.post(login_url, json={"username": _faka_username, "password": _faka_password})
+        if resp.status_code == 200 and resp.json().get("success"):
+            _faka_session = session
+            return session
+        else:
+            log(f"发卡平台登录失败: {resp.text}")
+            return None
+    except Exception as e:
+        log(f"发卡平台登录异常: {e}")
+        return None
+
+
+def upload_to_faka(result_file: str) -> bool:
+    """上传账号到发卡平台"""
+    session = faka_login()
+    if not session:
+        return False
+
+    try:
+        with open(result_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log(f"读取结果文件失败: {e}")
+        return False
+
+    token_output = data.get("token_output", {})
+    if not isinstance(token_output, dict):
+        token_output = {}
+
+    email = token_output.get("email") or data.get("email")
+    if not email:
+        log(f"结果文件中未找到邮箱: {result_file}")
+        return False
+
+    access_token = token_output.get("access_token")
+    refresh_token = token_output.get("refresh_token")
+    id_token = token_output.get("id_token")
+
+    token_data = {
+        "email": email,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+        "client_id": token_output.get("client_id"),
+        "client_secret": token_output.get("client_secret"),
+        "profile_arn": token_output.get("profile_arn"),
+        "region": token_output.get("region"),
+        "start_url": token_output.get("start_url"),
+    }
+    token_data = {k: v for k, v in token_data.items() if v is not None}
+
+    try:
+        url = f"{_faka_url.rstrip('/')}/api/admin/accounts"
+        resp = session.post(url, json={"accounts": [token_data]})
+        result = resp.json()
+        if result.get("success"):
+            imported = result.get("imported", [])
+            if imported:
+                log(f"上传发卡平台成功: {email}")
+                return True
+            else:
+                failed = result.get("failed", [])
+                if failed:
+                    log(f"上传发卡平台失败: {failed[0].get('error', '未知错误')}")
+                return False
+        else:
+            log(f"上传发卡平台失败: {result.get('error', '未知错误')}")
+            return False
+    except Exception as e:
+        log(f"上传发卡平台异常: {e}")
+        return False
 
 
 def classify_result(result_json: dict[str, Any]) -> dict[str, str]:
@@ -110,12 +201,19 @@ def run_one(
             email = token_output.get("email", "")
         status = classification["status"]
         log(f"[{idx}/{total}] 任务 {tag} 完成: status={status}, email={email}")
+
+        # 上传到发卡平台（仅成功时）
+        faka_uploaded = False
+        if status == "ok" and _faka_url:
+            faka_uploaded = upload_to_faka(result_file)
+
         return {
             "id": tag,
             "status": status,
             "result_file": result_file,
             "token_file": token_file,
             "email": email,
+            "faka_uploaded": faka_uploaded,
         }
 
     with lock:
@@ -154,6 +252,7 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         tag = r.get("id", "?")
         email = r.get("email", "")
         token_file = r.get("token_file", "")
+        faka_uploaded = r.get("faka_uploaded", False)
         status_icon = {"ok": "✓", "blocked": "✗", "failed": "✗", "unknown": "?"}.get(
             status, "?"
         )
@@ -162,6 +261,9 @@ def print_table(rows: list[dict[str, Any]]) -> None:
             parts.append(f"    邮箱: {email}")
         if token_file:
             parts.append(f"    文件: {token_file}")
+        if status == "ok" and _faka_url:
+            upload_icon = "↑" if faka_uploaded else "✗"
+            parts.append(f"    发卡: {upload_icon}")
         print("\n".join(parts))
     print("-" * 60)
 
@@ -191,7 +293,7 @@ def collect_success_files(rows: list[dict[str, Any]], run_id: str) -> str:
 
 
 def main() -> None:
-    global _log_file_path
+    global _log_file_path, _faka_url, _faka_username, _faka_password
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--count", type=int, default=1)
@@ -202,6 +304,9 @@ def main() -> None:
         default=os.path.join(os.getcwd(), "kiro_full_flow_cn.py"),
     )
     parser.add_argument("--run-id", default="batch")
+    parser.add_argument("--faka-url", help="发卡平台地址，如 https://faka.example.com")
+    parser.add_argument("--faka-username", help="发卡平台管理员用户名")
+    parser.add_argument("--faka-password", help="发卡平台管理员密码")
     args = parser.parse_args()
 
     if args.count < 1:
@@ -213,6 +318,11 @@ def main() -> None:
     env = os.environ.copy()
     lock = threading.Lock()
 
+    # 设置发卡平台配置
+    _faka_url = args.faka_url
+    _faka_username = args.faka_username
+    _faka_password = args.faka_password
+
     # 创建data目录和log文件
     data_dir = os.path.join(os.getcwd(), "data")
     os.makedirs(data_dir, exist_ok=True)
@@ -220,6 +330,8 @@ def main() -> None:
     _log_file_path = os.path.join(data_dir, log_filename)
 
     log(f"批量注册开始: count={args.count}, workers={args.workers}, run-id={run_id}")
+    if _faka_url:
+        log(f"发卡平台: {_faka_url}")
     log(f"日志文件: {_log_file_path}")
     start_time = time.time()
 

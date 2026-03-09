@@ -49,13 +49,13 @@
   "passwordSymbols": "!@#$%^&*()-_=+[]{}:,.?",
   "shortmail": {
     "api": {
-      "url": "duckmail" // duckmail(原方式) 或 tempmail(kiro-zhuce方式)
+      "url": "duckmail"
     },
-    "baseUrl": "https://temp-mail.xxxxx.workers.dev", //邮箱服务器域名
+    "baseUrl": "https://temp-mail.xxxxx.workers.dev",
     "origin": "https://xxxxx.xxxxx.workers.dev",
-    "adminkey": "AdminKey", //统一密钥：duckmail走Authorization Bearer，tempmail走x-admin-auth
-    "domain": "xxxx.com", //域名
-    "fingerprint": "299edca5955a3aec40b45fda12778cc9", //固定就行 无所谓
+    "adminkey": "AdminKey",
+    "domain": "xxxx.com",
+    "fingerprint": "299edca5955a3aec40b45fda12778cc9",
     "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
   },
   "tokenOutput": {
