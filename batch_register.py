@@ -186,6 +186,16 @@ def run_one(
             timeout=None,
         )
         output = "".join([completed.stdout or "", completed.stderr or ""])
+        # 将子进程输出写入日志文件
+        if _log_file_path and output:
+            with _log_lock:
+                with open(_log_file_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n{'=' * 40}\n")
+                    f.write(f"[{tag}] 子进程输出:\n")
+                    f.write(f"{'=' * 40}\n")
+                    f.write(output)
+                    if not output.endswith("\n"):
+                        f.write("\n")
     except Exception as e:
         log(f"[{idx}/{total}] 任务 {tag} 执行异常: {e}")
         return {"id": tag, "status": "failed", "error": str(e)}
