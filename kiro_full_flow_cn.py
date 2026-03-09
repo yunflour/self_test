@@ -80,6 +80,7 @@ class ShortmailConfig:
     domain: str
     fingerprint: str
     user_agent: str
+    random_fingerprint: bool
 
 
 @dataclass(frozen=True)
@@ -175,14 +176,21 @@ def load_app_config() -> AppConfig:
         str(k).lower(): str(v) for k, v in fixed_profile_arns_raw.items()
     }
 
+    # 处理 shortmail.fingerprint 的随机/固定配置
+    shortmail_random_fp = bool(shortmail_raw.get("randomFingerprint", True))
+    shortmail_fp_value = str(shortmail_raw.get("fingerprint", "") or "")
+    if shortmail_random_fp:
+        shortmail_fp_value = generate_fingerprint()
+
     shortmail = ShortmailConfig(
         api_url=str(shortmail_raw.get("api", {}).get("url", "duckmail")).strip().lower() or "duckmail",
         base_url=str(_require_key(shortmail_raw, "baseUrl", str)),
         origin=str(_require_key(shortmail_raw, "origin", str)),
         admin_key=str(shortmail_raw.get("adminkey", "")),
         domain=str(_require_key(shortmail_raw, "domain", str)),
-        fingerprint=str(_require_key(shortmail_raw, "fingerprint", str)),
+        fingerprint=shortmail_fp_value,
         user_agent=str(_require_key(shortmail_raw, "userAgent", str)),
+        random_fingerprint=shortmail_random_fp,
     )
 
     if shortmail.api_url not in {"duckmail", "tempmail"}:
@@ -210,6 +218,12 @@ def load_app_config() -> AppConfig:
 APP_CONFIG = load_app_config()
 FLOW_CONFIG = APP_CONFIG.flow
 
+# 打印 fingerprint 配置信息
+if APP_CONFIG.shortmail.random_fingerprint:
+    print(f"[config] shortmail.fingerprint: {APP_CONFIG.shortmail.fingerprint} (随机生成)")
+else:
+    print(f"[config] shortmail.fingerprint: {APP_CONFIG.shortmail.fingerprint} (固定值)")
+
 
 def now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -217,6 +231,16 @@ def now_str() -> str:
 
 def log(msg: str) -> None:
     print(f"[{now_str()}] {msg}")
+
+
+def generate_fingerprint() -> str:
+    """
+    生成随机的浏览器指纹，格式为 32 位小写十六进制字符串（标准 MD5 格式）。
+    基于 UUID + 时间戳 + 随机数生成，确保唯一性和合理性。
+    """
+    # 使用 UUID + 时间戳 + 随机数作为种子，生成 MD5 格式的指纹
+    seed = f"{uuid.uuid4().hex}-{time.time_ns()}-{random.randint(0, 999999)}"
+    return hashlib.md5(seed.encode("utf-8")).hexdigest()
 
 
 def b64url_no_padding(raw: bytes) -> str:
