@@ -13,7 +13,7 @@
     "profileArn": "",
     "browser": "camoufox",
     "camoufoxHeadless": true,
-    "camoufoxOs": "Windows",
+    "camoufoxOs": "windows",
     "camoufoxStartupTimeoutSeconds": null,
     "camoufoxAutofillEmail": true,
     "saveResult": true,
