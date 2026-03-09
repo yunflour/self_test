@@ -12,7 +12,7 @@
     "verifyCredential": true,
     "profileArn": "",
     "browser": "camoufox",
-    "camoufoxHeadless": false,
+    "camoufoxHeadless": true,
     "camoufoxOs": "windows",
     "camoufoxStartupTimeoutSeconds": null,
     "camoufoxAutofillEmail": true,
