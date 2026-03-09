@@ -110,6 +110,15 @@ def _require_key(container: dict[str, Any], key: str, expected_type: type) -> An
     return value
 
 
+def generate_fingerprint() -> str:
+    """
+    生成随机的浏览器指纹，格式为 32 位小写十六进制字符串（标准 MD5 格式）。
+    基于 UUID + 时间戳 + 随机数生成，确保唯一性和合理性。
+    """
+    seed = f"{uuid.uuid4().hex}-{time.time_ns()}-{random.randint(0, 999999)}"
+    return hashlib.md5(seed.encode("utf-8")).hexdigest()
+
+
 def load_app_config() -> AppConfig:
     config_path = os.environ.get(CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH)
     if not os.path.exists(config_path):
@@ -231,16 +240,6 @@ def now_str() -> str:
 
 def log(msg: str) -> None:
     print(f"[{now_str()}] {msg}")
-
-
-def generate_fingerprint() -> str:
-    """
-    生成随机的浏览器指纹，格式为 32 位小写十六进制字符串（标准 MD5 格式）。
-    基于 UUID + 时间戳 + 随机数生成，确保唯一性和合理性。
-    """
-    # 使用 UUID + 时间戳 + 随机数作为种子，生成 MD5 格式的指纹
-    seed = f"{uuid.uuid4().hex}-{time.time_ns()}-{random.randint(0, 999999)}"
-    return hashlib.md5(seed.encode("utf-8")).hexdigest()
 
 
 def b64url_no_padding(raw: bytes) -> str:
