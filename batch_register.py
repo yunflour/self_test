@@ -60,9 +60,13 @@ def extract_result_file(output: str) -> str | None:
 
 
 def load_json(path: str) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data if isinstance(data, dict) else {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        log(f"加载 JSON 文件失败: {path}, 错误: {e}")
+        return {}
 
 
 def faka_login() -> requests.Session | None:
@@ -75,7 +79,7 @@ def faka_login() -> requests.Session | None:
     try:
         session = requests.Session()
         login_url = f"{_faka_url.rstrip('/')}/admin/login"
-        resp = session.post(login_url, json={"username": _faka_username, "password": _faka_password})
+        resp = session.post(login_url, json={"username": _faka_username, "password": _faka_password}, timeout=30)
         if resp.status_code == 200 and resp.json().get("success"):
             _faka_session = session
             return session
@@ -128,7 +132,7 @@ def upload_to_faka(result_file: str) -> bool:
 
     try:
         url = f"{_faka_url.rstrip('/')}/api/admin/accounts"
-        resp = session.post(url, json={"accounts": [token_data]})
+        resp = session.post(url, json={"accounts": [token_data]}, timeout=30)
         result = resp.json()
         if result.get("success"):
             imported = result.get("imported", [])
@@ -177,6 +181,7 @@ def run_one(
     log(f"[{idx}/{total}] 开始任务 {tag}")
     job_env = dict(env)
     job_env["KIRO_RUN_ID"] = tag
+
     try:
         completed = subprocess.run(
             [python_exe, script_path],
@@ -196,39 +201,40 @@ def run_one(
                     f.write(output)
                     if not output.endswith("\n"):
                         f.write("\n")
+
+        result_file = extract_result_file(output)
+        if result_file and os.path.exists(result_file):
+            result_json = load_json(result_file)
+            classification = classify_result(result_json)
+            token_file = result_json.get("token_output_file", "")
+            email = ""
+            token_output = result_json.get("token_output")
+            if isinstance(token_output, dict):
+                email = token_output.get("email", "")
+            status = classification["status"]
+            log(f"[{idx}/{total}] 任务 {tag} 完成: status={status}, email={email}")
+
+            # 上传到发卡平台（仅成功时）
+            faka_uploaded = False
+            if status == "ok" and _faka_url:
+                faka_uploaded = upload_to_faka(result_file)
+
+            return {
+                "id": tag,
+                "status": status,
+                "result_file": result_file,
+                "token_file": token_file,
+                "email": email,
+                "faka_uploaded": faka_uploaded,
+            }
+
+        with lock:
+            log(f"[{idx}/{total}] 任务 {tag} 未找到结果文件，标记为 failed")
+        return {"id": tag, "status": "failed"}
+
     except Exception as e:
         log(f"[{idx}/{total}] 任务 {tag} 执行异常: {e}")
         return {"id": tag, "status": "failed", "error": str(e)}
-
-    result_file = extract_result_file(output)
-    if result_file and os.path.exists(result_file):
-        result_json = load_json(result_file)
-        classification = classify_result(result_json)
-        token_file = result_json.get("token_output_file", "")
-        email = ""
-        token_output = result_json.get("token_output")
-        if isinstance(token_output, dict):
-            email = token_output.get("email", "")
-        status = classification["status"]
-        log(f"[{idx}/{total}] 任务 {tag} 完成: status={status}, email={email}")
-
-        # 上传到发卡平台（仅成功时）
-        faka_uploaded = False
-        if status == "ok" and _faka_url:
-            faka_uploaded = upload_to_faka(result_file)
-
-        return {
-            "id": tag,
-            "status": status,
-            "result_file": result_file,
-            "token_file": token_file,
-            "email": email,
-            "faka_uploaded": faka_uploaded,
-        }
-
-    with lock:
-        log(f"[{idx}/{total}] 任务 {tag} 未找到结果文件，标记为 failed")
-    return {"id": tag, "status": "failed"}
 
 
 def print_table(rows: list[dict[str, Any]]) -> None:
@@ -246,16 +252,17 @@ def print_table(rows: list[dict[str, Any]]) -> None:
     sep = "-+-".join("-" * w for w in widths)
     val = " | ".join(v.ljust(w) for v, w in zip(values, widths))
 
-    print("\n" + "=" * 60)
-    print("结果汇总")
-    print("=" * 60)
-    print(line)
-    print(sep)
-    print(val)
+    log("")
+    log("=" * 60)
+    log("结果汇总")
+    log("=" * 60)
+    log(line)
+    log(sep)
+    log(val)
 
     # 逐条打印详情
-    print("\n详细列表：")
-    print("-" * 60)
+    log("详细列表：")
+    log("-" * 60)
     sorted_rows = sorted(rows, key=lambda r: r.get("id", ""))
     for r in sorted_rows:
         status = r.get("status", "unknown")
@@ -274,8 +281,8 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         if status == "ok" and _faka_url:
             upload_icon = "↑" if faka_uploaded else "✗"
             parts.append(f"    发卡: {upload_icon}")
-        print("\n".join(parts))
-    print("-" * 60)
+        log("\n".join(parts))
+    log("-" * 60)
 
 
 def collect_success_files(rows: list[dict[str, Any]], run_id: str) -> str:
@@ -364,8 +371,15 @@ def main() -> None:
             if idx < args.count - 1:
                 time.sleep(1)
         for fut in as_completed(futures):
-            rows.append(fut.result())
+            try:
+                result = fut.result()
+                rows.append(result)
+                log(f"已收集 {len(rows)}/{args.count} 个任务结果")
+            except Exception as e:
+                log(f"获取任务结果异常: {e}")
+                rows.append({"id": "unknown", "status": "failed", "error": str(e)})
 
+    log(f"所有任务已完成，共收集 {len(rows)} 个结果，开始汇总...")
     elapsed = time.time() - start_time
     print_table(rows)
 
