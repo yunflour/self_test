@@ -16,6 +16,7 @@
     "camoufoxOs": "windows",
     "camoufoxStartupTimeoutSeconds": null,
     "camoufoxAutofillEmail": true,
+    "camoufoxAutoBindMfa": true,
     "saveResult": true,
     "outputJson": false,
     "callbackPort": null,

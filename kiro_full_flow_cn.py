@@ -65,6 +65,7 @@ class FlowConfig:
     camoufox_os: str
     camoufox_startup_timeout_s: Optional[int]
     camoufox_autofill_email: bool
+    camoufox_auto_bind_mfa: bool
     save_result: bool
     output_json: bool
     callback_port: Optional[int]
@@ -158,6 +159,7 @@ def load_app_config() -> AppConfig:
         camoufox_autofill_email=bool(
             _require_key(flow_raw, "camoufoxAutofillEmail", bool)
         ),
+        camoufox_auto_bind_mfa=bool(flow_raw.get("camoufoxAutoBindMfa", True)),
         save_result=bool(_require_key(flow_raw, "saveResult", bool)),
         output_json=bool(_require_key(flow_raw, "outputJson", bool)),
         callback_port=(
@@ -887,11 +889,20 @@ class CamoufoxSession:
     在后台线程中托管 AsyncCamoufox 生命周期，便于主流程继续等待本地回调。
     """
 
-    def __init__(self, url: str, headless: bool, os_name: str, auto_fill_email: bool, skip_second_stage: bool = False):
+    def __init__(
+        self,
+        url: str,
+        headless: bool,
+        os_name: str,
+        auto_fill_email: bool,
+        auto_bind_mfa: bool,
+        skip_second_stage: bool = False,
+    ):
         self.url = url
         self.headless = headless
         self.os_name = os_name
         self.auto_fill_email = auto_fill_email
+        self.auto_bind_mfa = auto_bind_mfa
         self.skip_second_stage = skip_second_stage
         self.thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
@@ -913,6 +924,172 @@ class CamoufoxSession:
         self.fill_submitted = False
         self.name_fill_submitted = False
         self.autofill_error: Optional[str] = None
+        self.mfa_bind_attempted = False
+        self.mfa_bind_success = False
+        self.mfa_seed: Optional[str] = None
+        self.mfa_device_id: Optional[str] = None
+        self.mfa_workflow_state_handle: Optional[str] = None
+        self.mfa_error: Optional[str] = None
+
+    def _generate_totp_with_oathtool(self, seed: str) -> str:
+        cmd = ["oathtool", "--totp", "-b", seed]
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"oathtool 执行失败(returncode={completed.returncode}): "
+                f"{(completed.stderr or '').strip()}"
+            )
+        code = (completed.stdout or "").strip()
+        if not re.fullmatch(r"\d{6}", code):
+            raise RuntimeError(f"oathtool 输出不是 6 位验证码: {code!r}")
+        return code
+
+    def _extract_mfa_seed(self, payload: dict[str, Any]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        step_id = str(payload.get("stepId", "") or "")
+        ws = str(payload.get("workflowStateHandle", "") or "")
+        if step_id == "handle-registration-failure":
+            msg_ctx = payload.get("messagingContext")
+            if isinstance(msg_ctx, dict):
+                message_code = str(msg_ctx.get("messageCode", "") or "")
+                if message_code:
+                    self.mfa_error = message_code
+        workflow_data = payload.get("workflowResponseData")
+        if not isinstance(workflow_data, dict):
+            return step_id, None, ws or None
+        cfg = workflow_data.get("totpRegistrationConfigurationResponse")
+        if not isinstance(cfg, dict):
+            return step_id, None, ws or None
+        seed = str(cfg.get("totpRegistrationRequestSeed", "") or "")
+        device_id = str(cfg.get("mfaDeviceId", "") or "")
+        if seed and device_id:
+            self.mfa_seed = seed
+            self.mfa_device_id = device_id
+            self.mfa_workflow_state_handle = ws or self.mfa_workflow_state_handle
+            return step_id, device_id, ws or None
+        return step_id, None, ws or None
+
+    async def _wait_any_selector(
+        self, page: Any, selectors: list[str], timeout_ms: int
+    ) -> Any:
+        deadline = time.time() + timeout_ms / 1000.0
+        last_err: Optional[Exception] = None
+        while time.time() < deadline:
+            for selector in selectors:
+                locator = page.locator(selector).first
+                try:
+                    if await locator.count() > 0 and await locator.is_visible():
+                        return locator
+                except Exception as err:
+                    last_err = err
+                    continue
+            await page.wait_for_timeout(250)
+        raise RuntimeError(f"未找到可见元素: selectors={selectors}, last_err={last_err}")
+
+    async def _auto_bind_mfa_from_security_page(self, page: Any) -> None:
+        self.mfa_bind_attempted = True
+        self.mfa_bind_success = False
+        self.mfa_seed = None
+        self.mfa_device_id = None
+        self.mfa_workflow_state_handle = None
+        self.mfa_error = None
+
+        security_url = "https://us-east-1.credentials.signin.aws/#/security"
+        self._trace(f"开始自动 MFA 绑定，打开安全页: {security_url}")
+        await page.goto(security_url, wait_until="domcontentloaded", timeout=0)
+        await page.wait_for_function(
+            "() => document.readyState === 'complete'",
+            timeout=30000,
+        )
+        await page.wait_for_timeout(2500)
+
+        register_btn = await self._wait_any_selector(
+            page,
+            [
+                "button:has-text('注册设备')",
+                "button:has-text('Register device')",
+                "button[id='show-register-device-modal']",
+            ],
+            30000,
+        )
+        self._trace("已进入安全页，准备点击注册设备")
+        await random_trajectory_click(page, register_btn, self._trace, timeout=15000)
+        await page.wait_for_timeout(1500)
+
+        next_btn = await self._wait_any_selector(
+            page,
+            [
+                "button:has-text('下一步')",
+                "button:has-text('Next')",
+            ],
+            30000,
+        )
+        self._trace("MFA 设备类型页已出现，继续进入 TOTP 设置")
+        await random_trajectory_click(page, next_btn, self._trace, timeout=15000)
+
+        found = False
+        for _ in range(80):
+            if self.mfa_seed and self.mfa_device_id:
+                found = True
+                break
+            await page.wait_for_timeout(250)
+        if not found:
+            raise RuntimeError("未捕获到 MFA seed/deviceId")
+
+        self._trace(
+            f"已捕获 MFA seed/deviceId: mfaDeviceId={self.mfa_device_id}, workflowStateHandle={self.mfa_workflow_state_handle}"
+        )
+        code = await asyncio.to_thread(self._generate_totp_with_oathtool, self.mfa_seed)
+        self._trace(f"oathtool 已生成 MFA 验证码: {code}")
+
+        code_input = await self._wait_any_selector(
+            page,
+            [
+                "input[aria-label='身份验证器代码']",
+                "input[aria-label='Authenticator code']",
+                "input[inputmode='numeric']",
+                "input[type='text']",
+            ],
+            30000,
+        )
+        assign_btn = await self._wait_any_selector(
+            page,
+            [
+                "button:has-text('分配 MFA')",
+                "button:has-text('Assign MFA')",
+            ],
+            30000,
+        )
+
+        await code_input.click()
+        try:
+            await code_input.press("Control+A")
+            await code_input.press("Backspace")
+        except Exception:
+            pass
+        await code_input.type(code, delay=random.randint(35, 80))
+        await page.wait_for_timeout(random.randint(300, 700))
+        await random_trajectory_click(page, assign_btn, self._trace, timeout=15000)
+        await page.wait_for_timeout(4000)
+
+        body_text = ""
+        try:
+            body_text = await page.locator("body").inner_text(timeout=5000)
+        except Exception:
+            body_text = ""
+
+        if self.mfa_error:
+            raise RuntimeError(f"MFA 注册失败: {self.mfa_error}")
+        if "我们现在无法完成您的请求" in body_text or "Unable to complete your request" in body_text:
+            raise RuntimeError("MFA 注册失败: 通用错误页")
+
+        self.mfa_bind_success = True
+        self._trace("自动 MFA 绑定完成")
 
     def start(self) -> None:
         self.thread = threading.Thread(target=self._thread_entry, daemon=True)
@@ -964,6 +1141,29 @@ class CamoufoxSession:
             page = await context.new_page()
             page.set_default_timeout(0)
             page.set_default_navigation_timeout(0)
+
+            async def _handle_response(resp) -> None:
+                try:
+                    url = resp.url or ""
+                    if "/mfa/api/register" not in url:
+                        return
+                    payload = await resp.json()
+                    if not isinstance(payload, dict):
+                        return
+                    step_id, device_id, ws = self._extract_mfa_seed(payload)
+                    if device_id:
+                        self._trace(
+                            f"捕获 MFA 配置响应: stepId={step_id} mfaDeviceId={device_id}"
+                        )
+                        if ws:
+                            self._trace(f"捕获 workflowStateHandle: {ws}")
+                except Exception:
+                    return
+
+            def _on_response(resp):
+                asyncio.create_task(_handle_response(resp))
+
+            page.on("response", _on_response)
             self._trace("浏览器上下文创建成功，准备打开授权页")
             await page.goto(self.url, wait_until="domcontentloaded", timeout=0)
             self._trace(f"已打开授权页: {self.url}")
@@ -1468,6 +1668,24 @@ class CamoufoxSession:
                                         await page.wait_for_timeout(
                                             random.randint(400, 900)
                                         )
+                                        if self.auto_bind_mfa:
+                                            try:
+                                                mfa_page = await context.new_page()
+                                                mfa_page.set_default_timeout(0)
+                                                mfa_page.set_default_navigation_timeout(0)
+                                                mfa_page.on("response", _on_response)
+                                                await self._auto_bind_mfa_from_security_page(mfa_page)
+                                            except Exception as mfa_err:
+                                                self.mfa_error = str(mfa_err)
+                                                self._trace(
+                                                    f"注册前自动 MFA 绑定失败: {self.mfa_error}"
+                                                )
+                                            finally:
+                                                try:
+                                                    await mfa_page.close()
+                                                except Exception:
+                                                    pass
+
                                         await random_trajectory_click(page, allow_btn, self._trace, timeout=20000)
                                         self.allow_access_clicked = True
                                         self._trace(
@@ -1543,6 +1761,7 @@ def open_url_in_camoufox(
     headless: bool = False,
     os_name: str = "auto",
     auto_fill_email: bool = True,
+    auto_bind_mfa: bool = True,
     startup_timeout_s: Optional[int] = None,
 ) -> tuple[bool, str, Optional[CamoufoxSession]]:
     session = CamoufoxSession(
@@ -1550,6 +1769,7 @@ def open_url_in_camoufox(
         headless=headless,
         os_name=os_name,
         auto_fill_email=auto_fill_email,
+        auto_bind_mfa=auto_bind_mfa,
         skip_second_stage=FLOW_CONFIG.skip_second_stage,
     )
     session.start()
@@ -2178,6 +2398,7 @@ def main() -> None:
                     headless=config.camoufox_headless,
                     os_name=config.camoufox_os,
                     auto_fill_email=config.camoufox_autofill_email,
+                    auto_bind_mfa=config.camoufox_auto_bind_mfa,
                     startup_timeout_s=config.camoufox_startup_timeout_s,
                 )
             else:
@@ -2232,6 +2453,24 @@ def main() -> None:
                 )
                 final["stage2"]["authorize"]["browser_open"]["email_autofill_error"] = (
                     camoufox_session.autofill_error
+                )
+                final["stage2"]["authorize"]["browser_open"]["mfa_bind_attempted"] = (
+                    camoufox_session.mfa_bind_attempted
+                )
+                final["stage2"]["authorize"]["browser_open"]["mfa_bind_success"] = (
+                    camoufox_session.mfa_bind_success
+                )
+                final["stage2"]["authorize"]["browser_open"]["mfa_seed"] = (
+                    camoufox_session.mfa_seed
+                )
+                final["stage2"]["authorize"]["browser_open"]["mfa_device_id"] = (
+                    camoufox_session.mfa_device_id
+                )
+                final["stage2"]["authorize"]["browser_open"][
+                    "mfa_workflow_state_handle"
+                ] = camoufox_session.mfa_workflow_state_handle
+                final["stage2"]["authorize"]["browser_open"]["mfa_error"] = (
+                    camoufox_session.mfa_error
                 )
             if config.browser == "camoufox":
                 log(
