@@ -91,6 +91,14 @@ class TokenOutputConfig:
 
 
 @dataclass(frozen=True)
+class ProxyConfig:
+    enabled: bool
+    server: str
+    username: str
+    password: str
+
+
+@dataclass(frozen=True)
 class AppConfig:
     flow: FlowConfig
     callback_ports: list[int]
@@ -100,6 +108,7 @@ class AppConfig:
     password_symbols: str
     shortmail: ShortmailConfig
     token_output: TokenOutputConfig
+    proxy: ProxyConfig
 
 
 def _require_key(container: dict[str, Any], key: str, expected_type: type) -> Any:
@@ -214,6 +223,15 @@ def load_app_config() -> AppConfig:
         api_region=str(_require_key(token_output_raw, "apiRegion", str)),
     )
 
+    # 解析代理配置
+    proxy_raw = raw.get("proxy", {})
+    proxy = ProxyConfig(
+        enabled=bool(proxy_raw.get("enabled", False)),
+        server=str(proxy_raw.get("server", "")),
+        username=str(proxy_raw.get("username", "")),
+        password=str(proxy_raw.get("password", "")),
+    )
+
     return AppConfig(
         flow=flow,
         callback_ports=callback_ports,
@@ -223,6 +241,7 @@ def load_app_config() -> AppConfig:
         password_symbols=str(_require_key(raw, "passwordSymbols", str)),
         shortmail=shortmail,
         token_output=token_output,
+        proxy=proxy,
     )
 
 
@@ -234,6 +253,12 @@ if APP_CONFIG.shortmail.random_fingerprint:
     print(f"[config] shortmail.fingerprint: {APP_CONFIG.shortmail.fingerprint} (随机生成)")
 else:
     print(f"[config] shortmail.fingerprint: {APP_CONFIG.shortmail.fingerprint} (固定值)")
+
+# 打印代理配置信息
+if APP_CONFIG.proxy.enabled and APP_CONFIG.proxy.server:
+    print(f"[config] proxy: {APP_CONFIG.proxy.server} (已启用)")
+else:
+    print("[config] proxy: 未启用")
 
 
 def now_str() -> str:
@@ -897,6 +922,7 @@ class CamoufoxSession:
         auto_fill_email: bool,
         auto_bind_mfa: bool,
         skip_second_stage: bool = False,
+        proxy: Optional[ProxyConfig] = None,
     ):
         self.url = url
         self.headless = headless
@@ -904,6 +930,7 @@ class CamoufoxSession:
         self.auto_fill_email = auto_fill_email
         self.auto_bind_mfa = auto_bind_mfa
         self.skip_second_stage = skip_second_stage
+        self.proxy = proxy
         self.thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
@@ -1126,15 +1153,33 @@ class CamoufoxSession:
         context = None
         try:
             self._trace(f"准备启动浏览器: headless={self.headless}, os={selected_os}")
+            # 构建代理配置
+            proxy_config = None
+            firefox_prefs = {}
+            if self.proxy and self.proxy.enabled and self.proxy.server:
+                proxy_config = {
+                    "server": self.proxy.server,
+                    "bypass": "localhost,127.0.0.1,::1",
+                }
+                if self.proxy.username and self.proxy.password:
+                    proxy_config["username"] = self.proxy.username
+                    proxy_config["password"] = self.proxy.password
+                self._trace(f"使用代理: {self.proxy.server}")
+                # Firefox 代理绕过本地地址（双保险）
+                firefox_prefs["network.proxy.no_proxies_on"] = "localhost, 127.0.0.1, ::1"
+            # 启用代理时开启 geoip，自动匹配代理 IP 地区的指纹
+            use_geoip = proxy_config is not None
             camoufox_obj = AsyncCamoufox(
                 headless=self.headless,
                 os=selected_os,
                 locale="en-US",
                 humanize=False,
-                geoip=False,
+                geoip=use_geoip,
                 i_know_what_im_doing=True,
                 block_webrtc=True,
                 disable_coop=True,
+                proxy=proxy_config,
+                firefox_user_prefs=firefox_prefs if firefox_prefs else None,
             )
             browser = await camoufox_obj.__aenter__()
             context = await browser.new_context()
@@ -1777,6 +1822,7 @@ def open_url_in_camoufox(
     auto_fill_email: bool = True,
     auto_bind_mfa: bool = True,
     startup_timeout_s: Optional[int] = None,
+    proxy: Optional[ProxyConfig] = None,
 ) -> tuple[bool, str, Optional[CamoufoxSession]]:
     session = CamoufoxSession(
         url=url,
@@ -1785,6 +1831,7 @@ def open_url_in_camoufox(
         auto_fill_email=auto_fill_email,
         auto_bind_mfa=auto_bind_mfa,
         skip_second_stage=FLOW_CONFIG.skip_second_stage,
+        proxy=proxy,
     )
     session.start()
     ready = session.wait_ready(startup_timeout_s)
@@ -2103,8 +2150,17 @@ class LocalCallbackServer:
             self.thread.join(timeout=2)
 
 
-def new_http_session() -> requests.Session:
+def new_http_session(proxy: Optional[ProxyConfig] = None) -> requests.Session:
     s = requests.Session()
+    # 配置 SOCKS5 代理
+    if proxy and proxy.enabled and proxy.server:
+        proxies = {
+            "http": proxy.server,
+            "https": proxy.server,
+        }
+        s.proxies.update(proxies)
+        if proxy.username and proxy.password:
+            s.auth = (proxy.username, proxy.password)
     # 避免系统代理导致的请求偏转/失败
     s.trust_env = False
     return s
@@ -2275,7 +2331,7 @@ def main() -> None:
         "token_output": [],
     }
 
-    session = new_http_session()
+    session = new_http_session(APP_CONFIG.proxy)
     camoufox_session: Optional[CamoufoxSession] = None
 
     log("步骤 1/7：启动本地回调服务")
@@ -2310,7 +2366,8 @@ def main() -> None:
         log("步骤 4/7：触发第一层回调并提取 issuer_url / idc_region")
         log(f"第一层回调地址：{redirect_url}")
         try:
-            r1 = session.get(redirect_url, allow_redirects=False, timeout=15)
+            # localhost 请求不走代理，使用独立请求绕过 session 代理
+            r1 = requests.get(redirect_url, allow_redirects=False, timeout=15)
             log(f"已请求第一层回调地址，HTTP 状态：{r1.status_code}")
         except Exception as err:
             log(f"请求第一层回调地址失败：{err}")
@@ -2414,6 +2471,7 @@ def main() -> None:
                     auto_fill_email=config.camoufox_autofill_email,
                     auto_bind_mfa=config.camoufox_auto_bind_mfa,
                     startup_timeout_s=config.camoufox_startup_timeout_s,
+                    proxy=APP_CONFIG.proxy,
                 )
             else:
                 opened, detail = open_url_in_private_window(

@@ -1,5 +1,6 @@
 cbor2
 requests
-camoufox
+pysocks
+camoufox[geoip]
 
 pyotp

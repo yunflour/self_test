@@ -63,5 +63,11 @@
   "tokenOutput": {
     "authRegion": "us-east-1",
     "apiRegion": "us-west-2"
+  },
+  "proxy": {
+    "enabled": false,
+    "server": "socks5://127.0.0.1:40000",
+    "username": "",
+    "password": ""
   }
 }
