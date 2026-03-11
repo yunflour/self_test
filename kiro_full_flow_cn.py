@@ -1396,16 +1396,30 @@ class CamoufoxSession:
                                 await random_trajectory_click(page, name_continue_btn, self._trace, timeout=9000)
                             except Exception:
                                 pass
-                                
+
                             await page.wait_for_timeout(2000)
+
+                            # 检测 IP 封禁错误
+                            ip_blocked = await page.locator("text=/Sorry.*there was an error processing your request/i").count()
+                            if ip_blocked > 0:
+                                self._trace("检测到 IP 封禁错误，终止流程")
+                                raise RuntimeError("IP 被封禁：页面显示 'Sorry, there was an error processing your request. Please try again.'")
+
                             if await name_continue_btn.is_visible():
                                 try:
                                     await name_input.press("Enter")
                                     self._trace("姓名页 Continue 已通过 Enter 提交")
                                 except Exception:
                                     pass
-                                    
+
                             await page.wait_for_timeout(1000)
+
+                            # 再次检测 IP 封禁错误
+                            ip_blocked = await page.locator("text=/Sorry.*there was an error processing your request/i").count()
+                            if ip_blocked > 0:
+                                self._trace("检测到 IP 封禁错误，终止流程")
+                                raise RuntimeError("IP 被封禁：页面显示 'Sorry, there was an error processing your request. Please try again.'")
+
                             if not await name_continue_btn.is_visible():
                                 name_submitted = True
                                 break
