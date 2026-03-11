@@ -667,13 +667,13 @@ def pick_name_from_pool() -> tuple[str, str]:
 
     first_name, last_name = random.choice(pool)
     full_name = f"{first_name} {last_name}"
-    sanitized_last = _sanitize_for_email(last_name)
-    if not sanitized_last:
-        sanitized_last = _sanitize_for_email(first_name)
-    if not sanitized_last:
-        sanitized_last = "user"
+    sanitized_first = _sanitize_for_email(first_name)
+    if not sanitized_first:
+        sanitized_first = _sanitize_for_email(last_name)
+    if not sanitized_first:
+        sanitized_first = "user"
     nn = random.randint(1, 99)
-    email_username = f"{sanitized_last}{nn:02d}"
+    email_username = f"{sanitized_first}{nn:02d}"
     return full_name, email_username
 
 
