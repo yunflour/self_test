@@ -152,6 +152,10 @@ def upload_to_faka(result_file: str) -> bool:
 
 
 def classify_result(result_json: dict[str, Any]) -> dict[str, str]:
+    # 优先检测 IP 封禁
+    if result_json.get("ip_blocked"):
+        return {"status": "ban"}
+
     verify = result_json.get("credential_verify")
     if isinstance(verify, dict):
         status = str(verify.get("status", "unknown") or "unknown")
@@ -238,13 +242,14 @@ def run_one(
 
 def print_table(rows: list[dict[str, Any]]) -> None:
     total = len(rows)
-    blocked = sum(1 for r in rows if r.get("status") == "blocked")
     ok = sum(1 for r in rows if r.get("status") == "ok")
+    blocked = sum(1 for r in rows if r.get("status") == "blocked")
+    ban = sum(1 for r in rows if r.get("status") == "ban")
     failed = sum(1 for r in rows if r.get("status") == "failed")
     unknown = sum(1 for r in rows if r.get("status") == "unknown")
 
-    header = ["total", "ok", "blocked", "failed", "unknown"]
-    values = [str(total), str(ok), str(blocked), str(failed), str(unknown)]
+    header = ["total", "ok", "blocked", "ban", "failed", "unknown"]
+    values = [str(total), str(ok), str(blocked), str(ban), str(failed), str(unknown)]
     widths = [max(len(h), len(v)) for h, v in zip(header, values)]
 
     line = " | ".join(h.ljust(w) for h, w in zip(header, widths))
@@ -269,7 +274,7 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         email = r.get("email", "")
         token_file = r.get("token_file", "")
         faka_uploaded = r.get("faka_uploaded", False)
-        status_icon = {"ok": "✓", "blocked": "✗", "failed": "✗", "unknown": "?"}.get(
+        status_icon = {"ok": "✓", "blocked": "✗", "ban": "⛔", "failed": "✗", "unknown": "?"}.get(
             status, "?"
         )
         parts = [f"  {status_icon} [{status:>7s}] {tag}"]

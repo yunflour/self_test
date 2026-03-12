@@ -2688,6 +2688,9 @@ def main() -> None:
 
     except Exception as e:
         final["error"] = str(e)
+        # 检测 IP 封禁
+        if "IP 被封禁" in str(e):
+            final["ip_blocked"] = True
         log(f"流程失败：{e}")
     finally:
         if camoufox_session is not None:
