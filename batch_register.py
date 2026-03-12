@@ -10,6 +10,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,29 +19,129 @@ from typing import Any
 
 import requests
 
-# 全局日志文件路径和锁
-_log_file_path: str | None = None
-_log_lock = threading.Lock()
+# ANSI 颜色代码
+class Colors:
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    CYAN = "\033[96m"
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
 
-# 发卡平台配置（全局）
+# 状态图标（带颜色）
+STATUS_ICONS = {
+    "ok": f"{Colors.GREEN}✓{Colors.RESET}",
+    "blocked": f"{Colors.RED}✗{Colors.RESET}",
+    "ban": f"{Colors.RED}⛔{Colors.RESET}",
+    "failed": f"{Colors.RED}✗{Colors.RESET}",
+    "unknown": f"{Colors.YELLOW}?{Colors.RESET}",
+    "running": f"{Colors.CYAN}⋯{Colors.RESET}",
+}
+
+# 全局状态
+class GlobalState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.log_dir: str | None = None
+        self.task_log_dir: str | None = None
+        self.total_tasks = 0
+        self.completed = 0
+        self.results: list[dict[str, Any]] = []
+        self.running_tasks: set[str] = set()
+        # 计数
+        self.ok_count = 0
+        self.ban_count = 0
+        self.blocked_count = 0
+        self.failed_count = 0
+        self.unknown_count = 0
+
+    def add_running(self, task_id: str):
+        with self.lock:
+            self.running_tasks.add(task_id)
+            self._update_progress()
+
+    def remove_running(self, task_id: str):
+        with self.lock:
+            self.running_tasks.discard(task_id)
+
+    def add_result(self, result: dict[str, Any]):
+        with self.lock:
+            self.results.append(result)
+            self.completed += 1
+            status = result.get("status", "unknown")
+            if status == "ok":
+                self.ok_count += 1
+            elif status == "ban":
+                self.ban_count += 1
+            elif status == "blocked":
+                self.blocked_count += 1
+            elif status == "failed":
+                self.failed_count += 1
+            else:
+                self.unknown_count += 1
+            self._update_progress()
+
+    def _update_progress(self):
+        """更新进度条显示"""
+        # 清除当前行并移动到行首
+        sys.stdout.write("\r\033[K")
+        # 构建进度信息
+        progress = f"{Colors.BOLD}[{self.completed}/{self.total_tasks}]{Colors.RESET}"
+        counts = (
+            f"{Colors.GREEN}✓{self.ok_count}{Colors.RESET} "
+            f"{Colors.RED}⛔{self.ban_count}{Colors.RESET} "
+            f"{Colors.RED}✗{self.blocked_count}{Colors.RESET} "
+            f"{Colors.RED}?{self.failed_count}{Colors.RESET}"
+        )
+        # 显示正在运行的任务
+        running_str = ""
+        if self.running_tasks:
+            running_list = sorted(self.running_tasks)[:4]  # 最多显示4个
+            running_str = f" | 运行中: {', '.join(running_list)}"
+            if len(self.running_tasks) > 4:
+                running_str += f" +{len(self.running_tasks) - 4}"
+        sys.stdout.write(f"{progress} {counts}{running_str}")
+        sys.stdout.flush()
+
+    def finish_progress(self):
+        """完成进度显示，换行"""
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+_state = GlobalState()
+
+# 发卡平台配置
 _faka_url: str | None = None
 _faka_username: str | None = None
 _faka_password: str | None = None
 _faka_session: requests.Session | None = None
+_faka_lock = threading.Lock()
 
 
 def now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
-def log(msg: str) -> None:
-    """打印日志到控制台，同时写入log文件"""
+def log_to_file(msg: str, task_id: str | None = None) -> None:
+    """写入日志文件"""
+    if not _state.log_dir:
+        return
     log_line = f"[{now_str()}] {msg}"
-    print(log_line)
-    if _log_file_path:
-        with _log_lock:
-            with open(_log_file_path, "a", encoding="utf-8") as f:
-                f.write(log_line + "\n")
+    # 写入主日志
+    main_log = os.path.join(_state.log_dir, "main.log")
+    with open(main_log, "a", encoding="utf-8") as f:
+        f.write(log_line + "\n")
+    # 如果指定了任务ID，写入任务日志
+    if task_id and _state.task_log_dir:
+        task_log = os.path.join(_state.task_log_dir, f"{task_id}.log")
+        with open(task_log, "a", encoding="utf-8") as f:
+            f.write(log_line + "\n")
+
+
+def log(msg: str, task_id: str | None = None) -> None:
+    """打印日志（仅在非进度模式下）"""
+    log_to_file(msg, task_id)
 
 
 def normalize_run_id(value: str) -> str:
@@ -73,24 +174,25 @@ def faka_login() -> requests.Session | None:
     global _faka_session
     if not _faka_url or not _faka_username or not _faka_password:
         return None
-    if _faka_session:
-        return _faka_session
-    try:
-        session = requests.Session()
-        login_url = f"{_faka_url.rstrip('/')}/admin/login"
-        resp = session.post(login_url, json={"username": _faka_username, "password": _faka_password}, timeout=30)
-        if resp.status_code == 200 and resp.json().get("success"):
-            _faka_session = session
-            return session
-        else:
-            log(f"发卡平台登录失败: {resp.text}")
+    with _faka_lock:
+        if _faka_session:
+            return _faka_session
+        try:
+            session = requests.Session()
+            login_url = f"{_faka_url.rstrip('/')}/admin/login"
+            resp = session.post(login_url, json={"username": _faka_username, "password": _faka_password}, timeout=30)
+            if resp.status_code == 200 and resp.json().get("success"):
+                _faka_session = session
+                return session
+            else:
+                log(f"发卡平台登录失败: {resp.text}")
+                return None
+        except Exception as e:
+            log(f"发卡平台登录异常: {e}")
             return None
-    except Exception as e:
-        log(f"发卡平台登录异常: {e}")
-        return None
 
 
-def upload_to_faka(result_file: str) -> bool:
+def upload_to_faka(result_file: str, task_id: str) -> bool:
     """上传账号到发卡平台"""
     session = faka_login()
     if not session:
@@ -100,7 +202,7 @@ def upload_to_faka(result_file: str) -> bool:
         with open(result_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        log(f"读取结果文件失败: {e}")
+        log(f"读取结果文件失败: {e}", task_id)
         return False
 
     token_output = data.get("token_output", {})
@@ -109,7 +211,7 @@ def upload_to_faka(result_file: str) -> bool:
 
     email = token_output.get("email") or data.get("email")
     if not email:
-        log(f"结果文件中未找到邮箱: {result_file}")
+        log(f"结果文件中未找到邮箱: {result_file}", task_id)
         return False
 
     access_token = token_output.get("access_token")
@@ -136,18 +238,18 @@ def upload_to_faka(result_file: str) -> bool:
         if result.get("success"):
             imported = result.get("imported", [])
             if imported:
-                log(f"上传发卡平台成功: {email}")
+                log(f"上传发卡平台成功: {email}", task_id)
                 return True
             else:
                 failed = result.get("failed", [])
                 if failed:
-                    log(f"上传发卡平台失败: {failed[0].get('error', '未知错误')}")
+                    log(f"上传发卡平台失败: {failed[0].get('error', '未知错误')}", task_id)
                 return False
         else:
-            log(f"上传发卡平台失败: {result.get('error', '未知错误')}")
+            log(f"上传发卡平台失败: {result.get('error', '未知错误')}", task_id)
             return False
     except Exception as e:
-        log(f"上传发卡平台异常: {e}")
+        log(f"上传发卡平台异常: {e}", task_id)
         return False
 
 
@@ -178,10 +280,11 @@ def run_one(
     python_exe: str,
     script_path: str,
     env: dict[str, str],
-    lock: threading.Lock,
 ) -> dict[str, Any]:
     tag = f"{run_id}-{idx}"
-    log(f"[{idx}/{total}] 开始任务 {tag}")
+    log(f"开始任务 {tag}", tag)
+    _state.add_running(tag)
+
     job_env = dict(env)
     job_env["KIRO_RUN_ID"] = tag
 
@@ -194,16 +297,17 @@ def run_one(
             timeout=None,
         )
         output = "".join([completed.stdout or "", completed.stderr or ""])
-        # 将子进程输出写入日志文件
-        if _log_file_path and output:
-            with _log_lock:
-                with open(_log_file_path, "a", encoding="utf-8") as f:
-                    f.write(f"\n{'=' * 40}\n")
-                    f.write(f"[{tag}] 子进程输出:\n")
-                    f.write(f"{'=' * 40}\n")
-                    f.write(output)
-                    if not output.endswith("\n"):
-                        f.write("\n")
+
+        # 将子进程输出写入任务日志文件
+        if _state.task_log_dir and output:
+            task_log = os.path.join(_state.task_log_dir, f"{tag}.log")
+            with open(task_log, "a", encoding="utf-8") as f:
+                f.write(f"\n{'=' * 40}\n")
+                f.write(f"子进程输出:\n")
+                f.write(f"{'=' * 40}\n")
+                f.write(output)
+                if not output.endswith("\n"):
+                    f.write("\n")
 
         result_file = extract_result_file(output)
         if result_file and os.path.exists(result_file):
@@ -215,12 +319,12 @@ def run_one(
             if isinstance(token_output, dict):
                 email = token_output.get("email", "")
             status = classification["status"]
-            log(f"[{idx}/{total}] 任务 {tag} 完成: status={status}, email={email}")
+            log(f"完成: status={status}, email={email}", tag)
 
             # 上传到发卡平台（仅成功时）
             faka_uploaded = False
             if status == "ok" and _faka_url:
-                faka_uploaded = upload_to_faka(result_file)
+                faka_uploaded = upload_to_faka(result_file, tag)
 
             return {
                 "id": tag,
@@ -231,16 +335,18 @@ def run_one(
                 "faka_uploaded": faka_uploaded,
             }
 
-        with lock:
-            log(f"[{idx}/{total}] 任务 {tag} 未找到结果文件，标记为 failed")
+        log(f"未找到结果文件，标记为 failed", tag)
         return {"id": tag, "status": "failed"}
 
     except Exception as e:
-        log(f"[{idx}/{total}] 任务 {tag} 执行异常: {e}")
+        log(f"执行异常: {e}", tag)
         return {"id": tag, "status": "failed", "error": str(e)}
+    finally:
+        _state.remove_running(tag)
 
 
-def print_table(rows: list[dict[str, Any]]) -> None:
+def print_summary(rows: list[dict[str, Any]], elapsed: float) -> None:
+    """打印最终汇总"""
     total = len(rows)
     ok = sum(1 for r in rows if r.get("status") == "ok")
     blocked = sum(1 for r in rows if r.get("status") == "blocked")
@@ -248,25 +354,17 @@ def print_table(rows: list[dict[str, Any]]) -> None:
     failed = sum(1 for r in rows if r.get("status") == "failed")
     unknown = sum(1 for r in rows if r.get("status") == "unknown")
 
-    header = ["total", "ok", "blocked", "ban", "failed", "unknown"]
-    values = [str(total), str(ok), str(blocked), str(ban), str(failed), str(unknown)]
-    widths = [max(len(h), len(v)) for h, v in zip(header, values)]
+    print()
+    print(f"{Colors.BOLD}{'=' * 60}{Colors.RESET}")
+    print(f"{Colors.BOLD}结果汇总{Colors.RESET}")
+    print(f"{Colors.BOLD}{'=' * 60}{Colors.RESET}")
+    print(f"总数: {total} | {Colors.GREEN}✓ok:{ok}{Colors.RESET} | {Colors.RED}⛔ban:{ban}{Colors.RESET} | {Colors.RED}✗blocked:{blocked}{Colors.RESET} | {Colors.RED}?failed:{failed}{Colors.RESET} | unknown:{unknown}")
+    print(f"总耗时: {elapsed:.1f} 秒")
+    print()
 
-    line = " | ".join(h.ljust(w) for h, w in zip(header, widths))
-    sep = "-+-".join("-" * w for w in widths)
-    val = " | ".join(v.ljust(w) for v, w in zip(values, widths))
-
-    log("")
-    log("=" * 60)
-    log("结果汇总")
-    log("=" * 60)
-    log(line)
-    log(sep)
-    log(val)
-
-    # 逐条打印详情
-    log("详细列表：")
-    log("-" * 60)
+    # 详细列表
+    print(f"{Colors.BOLD}详细列表：{Colors.RESET}")
+    print("-" * 60)
     sorted_rows = sorted(rows, key=lambda r: r.get("id", ""))
     for r in sorted_rows:
         status = r.get("status", "unknown")
@@ -274,34 +372,34 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         email = r.get("email", "")
         token_file = r.get("token_file", "")
         faka_uploaded = r.get("faka_uploaded", False)
-        status_icon = {"ok": "✓", "blocked": "✗", "ban": "⛔", "failed": "✗", "unknown": "?"}.get(
-            status, "?"
-        )
-        parts = [f"  {status_icon} [{status:>7s}] {tag}"]
+        icon = STATUS_ICONS.get(status, "?")
+        line = f"  {icon} [{status:>7s}] {tag}"
         if email:
-            parts.append(f"    邮箱: {email}")
-        if token_file:
-            parts.append(f"    文件: {token_file}")
+            line += f" | {email}"
         if status == "ok" and _faka_url:
-            upload_icon = "↑" if faka_uploaded else "✗"
-            parts.append(f"    发卡: {upload_icon}")
-        log("\n".join(parts))
-    log("-" * 60)
+            upload_icon = f"{Colors.GREEN}↑{Colors.RESET}" if faka_uploaded else f"{Colors.RED}✗{Colors.RESET}"
+            line += f" | 发卡:{upload_icon}"
+        print(line)
+    print("-" * 60)
+
+    if ok > 0:
+        print(f"\n{Colors.GREEN}成功账号 token 文件已保存在 data/ok/ 目录{Colors.RESET}")
 
 
 def main() -> None:
-    global _log_file_path, _faka_url, _faka_username, _faka_password
+    global _faka_url, _faka_username, _faka_password
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--count", type=int, default=1)
-    parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--python", default="python3")
+    parser = argparse.ArgumentParser(description="批量注册 Kiro 账号")
+    parser.add_argument("--count", type=int, default=1, help="注册数量")
+    parser.add_argument("--workers", type=int, default=1, help="并发数")
+    parser.add_argument("--python", default="python3", help="Python 解释器路径")
     parser.add_argument(
         "--script",
         default=os.path.join(os.getcwd(), "kiro_full_flow_cn.py"),
+        help="注册脚本路径",
     )
-    parser.add_argument("--run-id", default="batch")
-    parser.add_argument("--faka-url", help="发卡平台地址，如 https://faka.example.com")
+    parser.add_argument("--run-id", default="batch", help="运行ID，用于日志目录名")
+    parser.add_argument("--faka-url", help="发卡平台地址")
     parser.add_argument("--faka-username", help="发卡平台管理员用户名")
     parser.add_argument("--faka-password", help="发卡平台管理员密码")
     args = parser.parse_args()
@@ -313,26 +411,39 @@ def main() -> None:
 
     run_id = normalize_run_id(args.run_id)
     env = os.environ.copy()
-    lock = threading.Lock()
 
     # 设置发卡平台配置
     _faka_url = args.faka_url
     _faka_username = args.faka_username
     _faka_password = args.faka_password
 
-    # 创建data目录和log文件
-    data_dir = os.path.join(os.getcwd(), "data")
-    os.makedirs(data_dir, exist_ok=True)
-    log_filename = datetime.now().strftime("%Y%m%d_%H%M%S") + ".log"
-    _log_file_path = os.path.join(data_dir, log_filename)
+    # 创建日志目录结构：log/<run_id>/
+    log_base = os.path.join(os.getcwd(), "log")
+    os.makedirs(log_base, exist_ok=True)
+    _state.log_dir = os.path.join(log_base, run_id)
+    os.makedirs(_state.log_dir, exist_ok=True)
+    _state.task_log_dir = os.path.join(_state.log_dir, "tasks")
+    os.makedirs(_state.task_log_dir, exist_ok=True)
+
+    # 创建 data/ok 目录
+    data_ok_dir = os.path.join(os.getcwd(), "data", "ok")
+    os.makedirs(data_ok_dir, exist_ok=True)
+
+    _state.total_tasks = args.count
+
+    # 打印启动信息
+    print(f"{Colors.BOLD}批量注册开始{Colors.RESET}")
+    print(f"  数量: {args.count}")
+    print(f"  并发: {args.workers}")
+    print(f"  运行ID: {run_id}")
+    print(f"  日志目录: {_state.log_dir}")
+    if _faka_url:
+        print(f"  发卡平台: {_faka_url}")
+    print()
 
     log(f"批量注册开始: count={args.count}, workers={args.workers}, run-id={run_id}")
-    if _faka_url:
-        log(f"发卡平台: {_faka_url}")
-    log(f"日志文件: {_log_file_path}")
     start_time = time.time()
 
-    rows: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = []
         for idx in range(args.count):
@@ -345,29 +456,25 @@ def main() -> None:
                     args.python,
                     args.script,
                     env,
-                    lock,
                 )
             )
             if idx < args.count - 1:
                 time.sleep(1)
+
         for fut in as_completed(futures):
             try:
                 result = fut.result()
-                rows.append(result)
-                log(f"已收集 {len(rows)}/{args.count} 个任务结果")
+                _state.add_result(result)
             except Exception as e:
                 log(f"获取任务结果异常: {e}")
-                rows.append({"id": "unknown", "status": "failed", "error": str(e)})
+                _state.add_result({"id": "unknown", "status": "failed", "error": str(e)})
 
-    log(f"所有任务已完成，共收集 {len(rows)} 个结果，开始汇总...")
+    _state.finish_progress()
     elapsed = time.time() - start_time
-    print_table(rows)
+    print_summary(_state.results, elapsed)
 
-    ok_count = sum(1 for r in rows if r.get("status") == "ok")
-    if ok_count > 0:
-        log(f"成功: {ok_count} 个，token 文件已保存在 data/ok/ 目录")
-
-    log(f"总耗时: {elapsed:.1f} 秒")
+    # 写入最终汇总到日志
+    log(f"批量注册完成: 总耗时 {elapsed:.1f} 秒")
 
 
 if __name__ == "__main__":
