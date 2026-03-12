@@ -9,7 +9,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -285,30 +284,6 @@ def print_table(rows: list[dict[str, Any]]) -> None:
     log("-" * 60)
 
 
-def collect_success_files(rows: list[dict[str, Any]], run_id: str) -> str:
-    """
-    将所有注册成功（status=ok）的 token 文件拷贝到 data/<run_id>/ 文件夹中。
-    返回目标文件夹路径。
-    """
-    dest_dir = os.path.join(os.getcwd(), "data", run_id)
-    os.makedirs(dest_dir, exist_ok=True)
-
-    copied = 0
-    for r in rows:
-        if r.get("status") != "ok":
-            continue
-        token_file = r.get("token_file", "")
-        if not token_file or not os.path.isfile(token_file):
-            log(f"任务 {r.get('id')} 状态为 ok 但 token 文件不存在: {token_file}")
-            continue
-        dest_path = os.path.join(dest_dir, os.path.basename(token_file))
-        shutil.copy2(token_file, dest_path)
-        copied += 1
-
-    log(f"已将 {copied} 个成功的 token 文件拷贝到: {dest_dir}")
-    return dest_dir
-
-
 def main() -> None:
     global _log_file_path, _faka_url, _faka_username, _faka_password
 
@@ -385,10 +360,7 @@ def main() -> None:
 
     ok_count = sum(1 for r in rows if r.get("status") == "ok")
     if ok_count > 0:
-        dest_dir = collect_success_files(rows, run_id)
-        log(f"成功文件夹: {dest_dir}")
-    else:
-        log("没有注册成功的账号，跳过文件归集")
+        log(f"成功: {ok_count} 个，token 文件已保存在 data/ok/ 目录")
 
     log(f"总耗时: {elapsed:.1f} 秒")
 

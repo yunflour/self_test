@@ -26,6 +26,7 @@ import json
 import os
 import random
 import re
+import shutil
 import socket
 import string
 import subprocess
@@ -290,28 +291,22 @@ def generate_code_challenge(code_verifier: str) -> str:
 
 
 def first_available_port(candidates: list[int]) -> int:
-    for port in candidates:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.bind(("127.0.0.1", port))
-                return port
-            except OSError:
-                continue
-    raise RuntimeError(
-        "候选端口均不可用，请在 FLOW_CONFIG.callback_port 中指定可用端口"
-    )
+    """已废弃，保留兼容性。实际端口绑定由 LocalCallbackServer 直接处理。"""
+    if not candidates:
+        raise RuntimeError("候选端口列表为空")
+    return candidates[0]
+
+
+# 全局锁，防止多进程竞争同一端口
+_port_lock = threading.Lock()
 
 
 def ensure_available_port(candidates: list[int], retries: int = 3) -> int:
-    last_err: Optional[Exception] = None
-    for _ in range(max(1, retries)):
-        try:
-            return first_available_port(candidates)
-        except Exception as e:
-            last_err = e
-            time.sleep(0.4)
-    raise RuntimeError(f"候选端口均不可用（重试 {retries} 次）：{last_err}")
+    """
+    返回候选端口列表本身，实际端口绑定由 LocalCallbackServer 完成。
+    使用锁保护以防止竞争。
+    """
+    return candidates[0] if candidates else 3128
 
 
 def build_portal_signin_url(
@@ -2128,22 +2123,43 @@ def make_handler(shared: CallbackState, success_redirect_url: str):
 
 class LocalCallbackServer:
     def __init__(
-        self, host: str, port: int, shared: CallbackState, success_redirect_url: str
+        self,
+        host: str,
+        port_candidates: list[int],
+        shared: CallbackState,
+        success_redirect_url: str,
     ):
         self.host = host
-        self.port = port
+        self.port: Optional[int] = None
         self.shared = shared
         self.success_redirect_url = success_redirect_url
-        self.server = ThreadingHTTPServer(
-            (host, port), make_handler(shared, success_redirect_url)
-        )
+        self.server: Optional[ThreadingHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
+
+        # 尝试绑定候选端口（使用锁防止竞争）
+        with _port_lock:
+            for p in port_candidates:
+                try:
+                    self.server = ThreadingHTTPServer(
+                        (host, p), make_handler(shared, success_redirect_url)
+                    )
+                    self.port = p
+                    break
+                except OSError:
+                    continue
+
+        if self.server is None:
+            raise RuntimeError(
+                f"所有候选端口均不可用: {port_candidates}"
+            )
 
     def start(self) -> None:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
     def stop(self) -> None:
+        if self.server is None:
+            return
         self.server.shutdown()
         self.server.server_close()
         if self.thread is not None:
@@ -2295,13 +2311,19 @@ def main() -> None:
     should_exchange_token = config.exchange_token
     token_file = build_default_token_file()
     mail_file: Optional[str] = None
-    port = config.callback_port or ensure_available_port(APP_CONFIG.callback_ports)
+    # 端口候选列表，优先使用配置中指定的端口
+    port_candidates = [config.callback_port] if config.callback_port else APP_CONFIG.callback_ports
     token_output: Optional[dict[str, Any]] = None
 
     # 第一阶段参数（Portal /signin + InitiateLogin）
     stage1_state = str(uuid.uuid4())
     stage1_code_verifier = generate_code_verifier()
     stage1_code_challenge = generate_code_challenge(stage1_code_verifier)
+    success_redirect = f"{config.portal_url.rstrip('/')}/signin?auth_status=success&redirect_from={config.redirect_from}"
+    shared = CallbackState(expected_stage1_state=stage1_state)
+    # 先启动回调服务器，确定实际绑定的端口
+    server = LocalCallbackServer("127.0.0.1", port_candidates, shared, success_redirect)
+    port = server.port  # 实际绑定的端口
     redirect_uri_stage1 = f"http://localhost:{port}"
     signin_url = build_portal_signin_url(
         portal_url=config.portal_url,
@@ -2310,10 +2332,6 @@ def main() -> None:
         redirect_uri=redirect_uri_stage1,
         redirect_from=config.redirect_from,
     )
-
-    success_redirect = f"{config.portal_url.rstrip('/')}/signin?auth_status=success&redirect_from={config.redirect_from}"
-    shared = CallbackState(expected_stage1_state=stage1_state)
-    server = LocalCallbackServer("127.0.0.1", port, shared, success_redirect)
 
     final: dict[str, Any] = {
         "portal": {
@@ -2708,6 +2726,14 @@ def main() -> None:
             save_json_file(result_file, final)
             final["result_file"] = result_file
             log(f"完整结果文件已保存：{result_file}")
+            # 注册成功时，额外复制到 data/ok/ 目录
+            credential_verify = final.get("credential_verify")
+            if isinstance(credential_verify, dict) and credential_verify.get("status") == "ok":
+                ok_dir = os.path.join(os.getcwd(), "data", "ok")
+                os.makedirs(ok_dir, exist_ok=True)
+                ok_token_file = os.path.join(ok_dir, os.path.basename(token_file))
+                shutil.copy2(token_file, ok_token_file)
+                log(f"账号注册成功，token 文件已复制到: {ok_token_file}")
         except Exception as save_err:
             final["save_error"] = str(save_err)
             log(f"保存最终 token 文件失败：{save_err}")
