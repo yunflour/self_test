@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -54,6 +55,38 @@ class GlobalState:
         self.blocked_count = 0
         self.failed_count = 0
         self.unknown_count = 0
+        # 停止标志和子进程跟踪
+        self.stop_event = threading.Event()
+        self.processes: dict[str, subprocess.Popen] = {}
+
+    def should_stop(self) -> bool:
+        return self.stop_event.is_set()
+
+    def request_stop(self):
+        self.stop_event.set()
+        self._kill_all_processes()
+
+    def register_process(self, task_id: str, proc: subprocess.Popen):
+        with self.lock:
+            self.processes[task_id] = proc
+
+    def unregister_process(self, task_id: str):
+        with self.lock:
+            self.processes.pop(task_id, None)
+
+    def _kill_all_processes(self):
+        """终止所有子进程"""
+        with self.lock:
+            processes = dict(self.processes)
+        for task_id, proc in processes.items():
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     def add_running(self, task_id: str):
         with self.lock:
@@ -282,21 +315,46 @@ def run_one(
     env: dict[str, str],
 ) -> dict[str, Any]:
     tag = f"{run_id}-{idx}"
+
+    # 检查是否已请求停止
+    if _state.should_stop():
+        log("收到停止信号，跳过任务", tag)
+        return {"id": tag, "status": "failed", "error": "cancelled"}
+
     log(f"开始任务 {tag}", tag)
     _state.add_running(tag)
 
     job_env = dict(env)
     job_env["KIRO_RUN_ID"] = tag
 
+    proc = None
     try:
-        completed = subprocess.run(
+        # 使用 Popen 以便能够终止子进程
+        proc = subprocess.Popen(
             [python_exe, script_path],
             env=job_env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=None,
         )
-        output = "".join([completed.stdout or "", completed.stderr or ""])
+        _state.register_process(tag, proc)
+
+        # 等待进程完成，同时检查停止信号
+        while proc.poll() is None:
+            if _state.should_stop():
+                log("收到停止信号，终止任务", tag)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return {"id": tag, "status": "failed", "error": "cancelled"}
+            time.sleep(0.1)
+
+        # 获取子进程输出
+        stdout, stderr = proc.communicate()
+        output = "".join([stdout or "", stderr or ""])
 
         # 将子进程输出写入任务日志文件
         if _state.task_log_dir and output:
@@ -342,6 +400,7 @@ def run_one(
         log(f"执行异常: {e}", tag)
         return {"id": tag, "status": "failed", "error": str(e)}
     finally:
+        _state.unregister_process(tag)
         _state.remove_running(tag)
 
 
@@ -416,6 +475,17 @@ def main() -> None:
     _faka_username = args.faka_username
     _faka_password = args.faka_password
 
+    # 注册信号处理器
+    def signal_handler(signum, frame):
+        print(f"\n\n⚠️ 收到终止信号，正在停止所有任务...")
+        _state.request_stop()
+        # 只处理一次信号
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     # 创建日志目录结构：log/<run_id>/
     log_base = os.path.join(os.getcwd(), "log")
     os.makedirs(log_base, exist_ok=True)
@@ -443,30 +513,36 @@ def main() -> None:
     log(f"批量注册开始: count={args.count}, workers={args.workers}, run-id={run_id}")
     start_time = time.time()
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = []
-        for idx in range(args.count):
-            futures.append(
-                executor.submit(
-                    run_one,
-                    run_id,
-                    idx + 1,
-                    args.count,
-                    args.python,
-                    args.script,
-                    env,
+    try:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = []
+            for idx in range(args.count):
+                # 检查停止信号
+                if _state.should_stop():
+                    break
+                futures.append(
+                    executor.submit(
+                        run_one,
+                        run_id,
+                        idx + 1,
+                        args.count,
+                        args.python,
+                        args.script,
+                        env,
+                    )
                 )
-            )
-            if idx < args.count - 1:
-                time.sleep(1)
+                if idx < args.count - 1:
+                    time.sleep(1)
 
-        for fut in as_completed(futures):
-            try:
-                result = fut.result()
-                _state.add_result(result)
-            except Exception as e:
-                log(f"获取任务结果异常: {e}")
-                _state.add_result({"id": "unknown", "status": "failed", "error": str(e)})
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                    _state.add_result(result)
+                except Exception as e:
+                    log(f"获取任务结果异常: {e}")
+                    _state.add_result({"id": "unknown", "status": "failed", "error": str(e)})
+    except KeyboardInterrupt:
+        print(f"\n⚠️ 用户中断，正在退出...")
 
     _state.finish_progress()
     elapsed = time.time() - start_time
