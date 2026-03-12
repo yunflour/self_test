@@ -28,14 +28,14 @@ class Colors:
     RESET = "\033[0m"
     BOLD = "\033[1m"
 
-# 状态图标（带颜色）
+# 状态图标（emoji）
 STATUS_ICONS = {
-    "ok": f"{Colors.GREEN}✓{Colors.RESET}",
-    "blocked": f"{Colors.RED}✗{Colors.RESET}",
-    "ban": f"{Colors.RED}⛔{Colors.RESET}",
-    "failed": f"{Colors.RED}✗{Colors.RESET}",
-    "unknown": f"{Colors.YELLOW}?{Colors.RESET}",
-    "running": f"{Colors.CYAN}⋯{Colors.RESET}",
+    "ok": "✅",
+    "blocked": "❌",
+    "ban": "⛔",
+    "failed": "❌",
+    "unknown": "❓",
+    "running": "⏳",
 }
 
 # 全局状态
@@ -88,16 +88,16 @@ class GlobalState:
         # 构建进度信息
         progress = f"{Colors.BOLD}[{self.completed}/{self.total_tasks}]{Colors.RESET}"
         counts = (
-            f"{Colors.GREEN}✓{self.ok_count}{Colors.RESET} "
-            f"{Colors.RED}⛔{self.ban_count}{Colors.RESET} "
-            f"{Colors.RED}✗{self.blocked_count}{Colors.RESET} "
-            f"{Colors.RED}?{self.failed_count}{Colors.RESET}"
+            f"✅{self.ok_count} "
+            f"⛔{self.ban_count} "
+            f"❌{self.blocked_count} "
+            f"❌{self.failed_count}"
         )
         # 显示正在运行的任务
         running_str = ""
         if self.running_tasks:
             running_list = sorted(self.running_tasks)[:4]  # 最多显示4个
-            running_str = f" | 运行中: {', '.join(running_list)}"
+            running_str = f" | ⏳ {', '.join(running_list)}"
             if len(self.running_tasks) > 4:
                 running_str += f" +{len(self.running_tasks) - 4}"
         sys.stdout.write(f"{progress} {counts}{running_str}")
@@ -356,34 +356,33 @@ def print_summary(rows: list[dict[str, Any]], elapsed: float) -> None:
 
     print()
     print(f"{Colors.BOLD}{'=' * 60}{Colors.RESET}")
-    print(f"{Colors.BOLD}结果汇总{Colors.RESET}")
+    print(f"{Colors.BOLD}📊 结果汇总{Colors.RESET}")
     print(f"{Colors.BOLD}{'=' * 60}{Colors.RESET}")
-    print(f"总数: {total} | {Colors.GREEN}✓ok:{ok}{Colors.RESET} | {Colors.RED}⛔ban:{ban}{Colors.RESET} | {Colors.RED}✗blocked:{blocked}{Colors.RESET} | {Colors.RED}?failed:{failed}{Colors.RESET} | unknown:{unknown}")
-    print(f"总耗时: {elapsed:.1f} 秒")
+    print(f"总数: {total} | ✅{ok} | ⛔{ban} | ❌{blocked} | ❓{unknown}")
+    print(f"⏱️ 总耗时: {elapsed:.1f} 秒")
     print()
 
     # 详细列表
-    print(f"{Colors.BOLD}详细列表：{Colors.RESET}")
+    print(f"{Colors.BOLD}📋 详细列表：{Colors.RESET}")
     print("-" * 60)
     sorted_rows = sorted(rows, key=lambda r: r.get("id", ""))
     for r in sorted_rows:
         status = r.get("status", "unknown")
         tag = r.get("id", "?")
         email = r.get("email", "")
-        token_file = r.get("token_file", "")
         faka_uploaded = r.get("faka_uploaded", False)
-        icon = STATUS_ICONS.get(status, "?")
-        line = f"  {icon} [{status:>7s}] {tag}"
+        icon = STATUS_ICONS.get(status, "❓")
+        line = f"  {icon} {tag}"
         if email:
             line += f" | {email}"
         if status == "ok" and _faka_url:
-            upload_icon = f"{Colors.GREEN}↑{Colors.RESET}" if faka_uploaded else f"{Colors.RED}✗{Colors.RESET}"
-            line += f" | 发卡:{upload_icon}"
+            upload_icon = "📤" if faka_uploaded else "❌"
+            line += f" | {upload_icon}"
         print(line)
     print("-" * 60)
 
     if ok > 0:
-        print(f"\n{Colors.GREEN}成功账号 token 文件已保存在 data/ok/ 目录{Colors.RESET}")
+        print(f"\n✅ 成功账号 token 文件已保存在 data/ok/ 目录")
 
 
 def main() -> None:
