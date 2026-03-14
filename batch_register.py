@@ -313,6 +313,7 @@ def run_one(
     python_exe: str,
     script_path: str,
     env: dict[str, str],
+    timeout_s: int | None = None,
 ) -> dict[str, Any]:
     tag = f"{run_id}-{idx}"
 
@@ -328,6 +329,7 @@ def run_one(
     job_env["KIRO_RUN_ID"] = tag
 
     proc = None
+    start_time = time.time()
     try:
         # 使用 Popen 以便能够终止子进程
         proc = subprocess.Popen(
@@ -339,8 +341,20 @@ def run_one(
         )
         _state.register_process(tag, proc)
 
-        # 等待进程完成，同时检查停止信号
+        # 等待进程完成，同时检查停止信号和超时
         while proc.poll() is None:
+            # 检查超时
+            if timeout_s and (time.time() - start_time) > timeout_s:
+                log(f"任务超时 ({timeout_s}秒)，终止任务", tag)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return {"id": tag, "status": "failed", "error": "timeout"}
+
+            # 检查停止信号
             if _state.should_stop():
                 log("收到停止信号，终止任务", tag)
                 proc.terminate()
@@ -460,6 +474,12 @@ def main() -> None:
     parser.add_argument("--faka-url", help="发卡平台地址")
     parser.add_argument("--faka-username", help="发卡平台管理员用户名")
     parser.add_argument("--faka-password", help="发卡平台管理员密码")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="单个任务超时时间（秒），默认 600 秒，设为 0 禁用超时",
+    )
     args = parser.parse_args()
 
     if args.count < 1:
@@ -505,13 +525,17 @@ def main() -> None:
     print(f"  数量: {args.count}")
     print(f"  并发: {args.workers}")
     print(f"  运行ID: {run_id}")
+    print(f"  超时: {args.timeout}秒" if args.timeout else "  超时: 禁用")
     print(f"  日志目录: {_state.log_dir}")
     if _faka_url:
         print(f"  发卡平台: {_faka_url}")
     print()
 
-    log(f"批量注册开始: count={args.count}, workers={args.workers}, run-id={run_id}")
+    log(f"批量注册开始: count={args.count}, workers={args.workers}, run-id={run_id}, timeout={args.timeout}")
     start_time = time.time()
+
+    # 超时参数：0 表示禁用
+    timeout_val = args.timeout if args.timeout > 0 else None
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -529,6 +553,7 @@ def main() -> None:
                         args.python,
                         args.script,
                         env,
+                        timeout_val,
                     )
                 )
                 if idx < args.count - 1:
