@@ -62,8 +62,9 @@ class FlowConfig:
     verify_credential: bool
     profile_arn: str
     browser: str
-    camoufox_headless: bool
+    camoufox_headless: Union[bool, str]  # True, False, 或 "virtual"
     camoufox_os: str
+    camoufox_xvfb_args: Optional[str]  # Xvfb 启动参数，仅在 headless="virtual" 时生效
     camoufox_startup_timeout_s: Optional[int]
     camoufox_autofill_email: bool
     camoufox_auto_bind_mfa: bool
@@ -121,6 +122,27 @@ def _require_key(container: dict[str, Any], key: str, expected_type: type) -> An
     return value
 
 
+def _parse_headless(value: Any) -> Union[bool, str]:
+    """
+    解析 camoufoxHeadless 配置值。
+    支持: true/false (bool), "true"/"false" (str), "virtual" (str)
+    返回: True, False, 或 "virtual"
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v == "virtual":
+            return "virtual"
+        if v == "true":
+            return True
+        if v == "false":
+            return False
+        raise RuntimeError(f"无效的 camoufoxHeadless 值: {value}，期望 true/false/virtual")
+    # 默认返回 True
+    return True
+
+
 def generate_fingerprint() -> str:
     """
     生成随机的浏览器指纹，格式为 32 位小写十六进制字符串（标准 MD5 格式）。
@@ -159,8 +181,13 @@ def load_app_config() -> AppConfig:
         verify_credential=bool(_require_key(flow_raw, "verifyCredential", bool)),
         profile_arn=str(_require_key(flow_raw, "profileArn", str)),
         browser=str(_require_key(flow_raw, "browser", str)),
-        camoufox_headless=bool(_require_key(flow_raw, "camoufoxHeadless", bool)),
+        camoufox_headless=_parse_headless(flow_raw.get("camoufoxHeadless", True)),
         camoufox_os=str(_require_key(flow_raw, "camoufoxOs", str)),
+        camoufox_xvfb_args=(
+            str(flow_raw["camoufoxXvfbArgs"])
+            if flow_raw.get("camoufoxXvfbArgs")
+            else None
+        ),
         camoufox_startup_timeout_s=(
             int(flow_raw["camoufoxStartupTimeoutSeconds"])
             if flow_raw.get("camoufoxStartupTimeoutSeconds") is not None
@@ -912,16 +939,19 @@ class CamoufoxSession:
     def __init__(
         self,
         url: str,
-        headless: bool,
+        headless: Union[bool, str],
         os_name: str,
         auto_fill_email: bool,
         auto_bind_mfa: bool,
         skip_second_stage: bool = False,
         proxy: Optional[ProxyConfig] = None,
+        xvfb_args: Optional[str] = None,
     ):
         self.url = url
         self.headless = headless
         self.os_name = os_name
+        self.xvfb_args = xvfb_args
+        self._xvfb_process = None  # Xvfb 进程句柄
         self.auto_fill_email = auto_fill_email
         self.auto_bind_mfa = auto_bind_mfa
         self.skip_second_stage = skip_second_stage
@@ -1144,10 +1174,59 @@ class CamoufoxSession:
         if selected_os == "auto":
             selected_os = random.choice(["windows", "macos", "linux"])
 
+        # 运行时校验：headless='virtual' 仅支持 Linux，与 windows/macos 互斥
+        if self.headless == "virtual" and selected_os in ("windows", "macos"):
+            self.error = (
+                f"headless='virtual' 仅支持 Linux，当前 os={selected_os} 不兼容。"
+                f"请改为：camoufoxHeadless: true（传统 headless）或 camoufoxOs: linux（使用 virtual display）。"
+            )
+            self._trace(self.error)
+            self.ready_event.set()
+            return
+
+        # 如果是 virtual 模式且有自定义 Xvfb 参数，先启动外部 Xvfb，随后以 headless=False 连接该 DISPLAY
+        effective_headless: Union[bool, str] = self.headless
+        if self.headless == "virtual" and self.xvfb_args:
+            import os
+            import shlex
+            try:
+                # 找一个空闲的 DISPLAY 编号
+                display_num = 99
+                while True:
+                    lock_file = f"/tmp/.X{display_num}-lock"
+                    if not os.path.exists(lock_file):
+                        break
+                    display_num += 1
+                    if display_num > 200:
+                        raise RuntimeError("无法找到空闲的 DISPLAY 编号")
+
+                display = f":{display_num}"
+                xvfb_cmd = ["Xvfb", display] + shlex.split(self.xvfb_args)
+                self._trace(f"启动 Xvfb: {' '.join(xvfb_cmd)}")
+                self._xvfb_process = subprocess.Popen(
+                    xvfb_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                # 等待 Xvfb 启动
+                time.sleep(0.5)
+                # 设置 DISPLAY 环境变量，并改为非 virtual 模式，避免 Camoufox 再次启动自己的 virtual display
+                os.environ["DISPLAY"] = display
+                effective_headless = False
+                self._trace(
+                    f"Xvfb 已启动，DISPLAY={display}, PID={self._xvfb_process.pid}；"
+                    f"Camoufox 将以 headless=False 连接该 DISPLAY"
+                )
+            except Exception as xvfb_err:
+                self.error = f"启动 Xvfb 失败: {xvfb_err}"
+                self._trace(self.error)
+                self.ready_event.set()
+                return
+
         camoufox_obj = None
         context = None
         try:
-            self._trace(f"准备启动浏览器: headless={self.headless}, os={selected_os}")
+            self._trace(f"准备启动浏览器: headless={effective_headless}, os={selected_os}")
             # 构建代理配置
             proxy_config = None
             firefox_prefs = {}
@@ -1164,18 +1243,20 @@ class CamoufoxSession:
                 firefox_prefs["network.proxy.no_proxies_on"] = "localhost, 127.0.0.1, ::1"
             # 启用代理时开启 geoip，自动匹配代理 IP 地区的指纹
             use_geoip = proxy_config is not None
-            camoufox_obj = AsyncCamoufox(
-                headless=self.headless,
-                os=selected_os,
-                locale="en-US",
-                humanize=False,
-                geoip=use_geoip,
-                i_know_what_im_doing=True,
-                block_webrtc=True,
-                disable_coop=True,
-                proxy=proxy_config,
-                firefox_user_prefs=firefox_prefs if firefox_prefs else None,
-            )
+            # 构建 AsyncCamoufox 参数
+            camoufox_kwargs = {
+                "headless": effective_headless,
+                "os": selected_os,
+                "locale": "en-US",
+                "humanize": False,
+                "geoip": use_geoip,
+                "i_know_what_im_doing": True,
+                "block_webrtc": True,
+                "disable_coop": True,
+                "proxy": proxy_config,
+                "firefox_user_prefs": firefox_prefs if firefox_prefs else None,
+            }
+            camoufox_obj = AsyncCamoufox(**camoufox_kwargs)
             browser = await camoufox_obj.__aenter__()
             context = await browser.new_context()
             page = await context.new_page()
@@ -1808,16 +1889,30 @@ class CamoufoxSession:
         self.stop_event.set()
         if self.thread is not None:
             self.thread.join(timeout=10)
+        # 清理 Xvfb 进程
+        if self._xvfb_process is not None:
+            try:
+                self._xvfb_process.terminate()
+                self._xvfb_process.wait(timeout=5)
+                self._trace(f"Xvfb 进程已终止 (PID={self._xvfb_process.pid})")
+            except Exception as e:
+                try:
+                    self._xvfb_process.kill()
+                except Exception:
+                    pass
+            finally:
+                self._xvfb_process = None
 
 
 def open_url_in_camoufox(
     url: str,
-    headless: bool = False,
+    headless: Union[bool, str] = False,
     os_name: str = "auto",
     auto_fill_email: bool = True,
     auto_bind_mfa: bool = True,
     startup_timeout_s: Optional[int] = None,
     proxy: Optional[ProxyConfig] = None,
+    xvfb_args: Optional[str] = None,
 ) -> tuple[bool, str, Optional[CamoufoxSession]]:
     session = CamoufoxSession(
         url=url,
@@ -1827,6 +1922,7 @@ def open_url_in_camoufox(
         auto_bind_mfa=auto_bind_mfa,
         skip_second_stage=FLOW_CONFIG.skip_second_stage,
         proxy=proxy,
+        xvfb_args=xvfb_args,
     )
     session.start()
     ready = session.wait_ready(startup_timeout_s)
@@ -2490,6 +2586,7 @@ def main() -> None:
                     auto_bind_mfa=config.camoufox_auto_bind_mfa,
                     startup_timeout_s=config.camoufox_startup_timeout_s,
                     proxy=APP_CONFIG.proxy,
+                    xvfb_args=config.camoufox_xvfb_args,
                 )
             else:
                 opened, detail = open_url_in_private_window(
