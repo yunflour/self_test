@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
@@ -557,7 +558,10 @@ def main() -> None:
                     )
                 )
                 if idx < args.count - 1:
-                    time.sleep(1)
+                    # 随机错峰启动：2-8秒，避免固定1秒批量特征
+                    sleep_delay = random.uniform(2.0, 8.0)
+                    log(f"任务 {idx + 1} 已提交，等待 {sleep_delay:.1f}s 后提交下一个")
+                    time.sleep(sleep_delay)
 
             for fut in as_completed(futures):
                 try:

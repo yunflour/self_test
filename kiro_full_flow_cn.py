@@ -330,10 +330,14 @@ _port_lock = threading.Lock()
 
 def ensure_available_port(candidates: list[int], retries: int = 3) -> int:
     """
-    返回候选端口列表本身，实际端口绑定由 LocalCallbackServer 完成。
+    从候选端口列表中随机选择一个端口。
+    实际端口绑定由 LocalCallbackServer 完成。
     使用锁保护以防止竞争。
     """
-    return candidates[0] if candidates else 3128
+    if not candidates:
+        return 3128
+    # 随机选择，避免总是使用首个端口形成批量特征
+    return random.choice(candidates)
 
 
 def build_portal_signin_url(
@@ -901,7 +905,8 @@ async def random_trajectory_click(page, locator, trace_func=None, timeout=10000)
         sx = max(1.0, tx + random.uniform(-180, -70))
         sy = max(1.0, ty + random.uniform(-90, 90))
         await page.mouse.move(sx, sy)
-        await page.wait_for_timeout(random.randint(90, 220))
+        # 扩大起始等待范围，添加更自然的思考时间
+        await page.wait_for_timeout(random.randint(150, 400))
 
         steps = random.randint(4, 7)
         for step in range(1, steps + 1):
@@ -909,12 +914,15 @@ async def random_trajectory_click(page, locator, trace_func=None, timeout=10000)
             mx = sx + (tx - sx) * ratio + random.uniform(-1.8, 1.8)
             my = sy + (ty - sy) * ratio + random.uniform(-1.2, 1.2)
             await page.mouse.move(mx, my)
-            await page.wait_for_timeout(random.randint(45, 110))
+            # 扩大步骤间等待范围
+            await page.wait_for_timeout(random.randint(60, 180))
 
         await page.mouse.move(tx, ty)
-        await page.wait_for_timeout(random.randint(70, 180))
+        # 扩大目标点等待范围
+        await page.wait_for_timeout(random.randint(120, 350))
         await page.mouse.down()
-        await page.wait_for_timeout(random.randint(45, 140))
+        # 扩大按下等待范围
+        await page.wait_for_timeout(random.randint(80, 200))
         await page.mouse.up()
         click_sent = True
         if trace_func:
@@ -927,7 +935,7 @@ async def random_trajectory_click(page, locator, trace_func=None, timeout=10000)
                 trace_func("按钮已通过 locator.click 点击")
         except Exception as click_err:
             raise RuntimeError(f"按钮单次点击失败：{click_err}") from click_err
-            
+
     return click_sent
 
 
@@ -1125,7 +1133,7 @@ class CamoufoxSession:
         except Exception:
             pass
         await code_input.type(code, delay=random.randint(35, 80))
-        await page.wait_for_timeout(random.randint(300, 700))
+        await page.wait_for_timeout(random.randint(400, 1200))
         await random_trajectory_click(page, assign_btn, self._trace, timeout=15000)
         await page.wait_for_timeout(4000)
 
@@ -1223,6 +1231,20 @@ class CamoufoxSession:
                 self.ready_event.set()
                 return
 
+        # 伪装桌面环境变量，避免暴露无桌面环境特征
+        # 当 headless=True 且 camoufoxOs=windows 时，环境变量伪装尤为重要
+        if self.headless:
+            # 设置 DISPLAY 环境变量（X11）
+            if not os.environ.get("DISPLAY"):
+                os.environ["DISPLAY"] = ":0"
+            # 设置 Wayland 环境变量
+            if not os.environ.get("WAYLAND_DISPLAY"):
+                os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+            # 设置 XDG_SESSION_TYPE 为图形会话
+            if not os.environ.get("XDG_SESSION_TYPE"):
+                os.environ["XDG_SESSION_TYPE"] = "wayland"
+            self._trace(f"已伪装环境变量: DISPLAY={os.environ.get('DISPLAY')}, XDG_SESSION_TYPE={os.environ.get('XDG_SESSION_TYPE')}")
+
         camoufox_obj = None
         context = None
         try:
@@ -1243,20 +1265,41 @@ class CamoufoxSession:
                 firefox_prefs["network.proxy.no_proxies_on"] = "localhost, 127.0.0.1, ::1"
             # 启用代理时开启 geoip，自动匹配代理 IP 地区的指纹
             use_geoip = proxy_config is not None
-            # 构建 AsyncCamoufox 参数
-            camoufox_kwargs = {
-                "headless": effective_headless,
-                "os": selected_os,
-                "locale": "en-US",
-                "humanize": False,
-                "geoip": use_geoip,
-                "i_know_what_im_doing": True,
-                "block_webrtc": True,
-                "disable_coop": True,
-                "proxy": proxy_config,
-                "firefox_user_prefs": firefox_prefs if firefox_prefs else None,
+            # WebGL 伪装：使用常见 GPU 配置，避免 headless 环境下 WebGL 为空
+            # 格式: (vendor, renderer)
+            webgl_configs = {
+                "win": [
+                    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0)"),
+                    ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0)"),
+                    ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0)"),
+                ],
+                "mac": [
+                    ("Apple Inc.", "Apple M1"),
+                    ("Intel Inc.", "Intel(R) Iris(R) Plus Graphics 640"),
+                ],
+                "lin": [
+                    ("NVIDIA Corporation", "NVIDIA GeForce GTX 1060/PCIe/SSE2"),
+                    ("Intel", "Intel(R) UHD Graphics 630 (CFL GT2)"),
+                ],
             }
-            camoufox_obj = AsyncCamoufox(**camoufox_kwargs)
+            # 根据目标 OS 选择对应的 GPU 列表
+            os_key = selected_os[:3] if selected_os else "win"  # windows->win, macos->mac, linux->lin
+            gpu_list = webgl_configs.get(os_key, webgl_configs["win"])
+            selected_webgl = random.choice(gpu_list)
+            self._trace(f"WebGL 指纹: vendor={selected_webgl[0]}, renderer={selected_webgl[1][:50]}...")
+            camoufox_obj = AsyncCamoufox(
+                headless=effective_headless,
+                os=selected_os,
+                locale="en-US",
+                humanize=False,
+                geoip=use_geoip,
+                i_know_what_im_doing=True,
+                block_webrtc=True,
+                disable_coop=True,
+                proxy=proxy_config,
+                firefox_user_prefs=firefox_prefs if firefox_prefs else None,
+                webgl_config=selected_webgl,
+            )
             browser = await camoufox_obj.__aenter__()
             context = await browser.new_context()
             page = await context.new_page()
@@ -1304,7 +1347,7 @@ class CamoufoxSession:
                         pass
 
                     # 用户反馈按钮点击过早，这里显式多等一段时间让页面脚本和动画稳定。
-                    await page.wait_for_timeout(random.randint(2600, 4200))
+                    await page.wait_for_timeout(random.randint(3000, 6000))
 
                     self._trace("从姓名库选取姓名并申请短效邮箱")
                     picked_full_name, picked_email_username = pick_name_from_pool()
@@ -1368,7 +1411,7 @@ class CamoufoxSession:
                     except Exception:
                         pass
 
-                    await page.wait_for_timeout(random.randint(700, 1400))
+                    await page.wait_for_timeout(random.randint(1000, 2500))
 
                     continue_btn = page.locator(primary_continue_selector).first
                     if await continue_btn.count() == 0:
@@ -1381,7 +1424,7 @@ class CamoufoxSession:
 
                     await continue_btn.wait_for(state="visible", timeout=60000)
                     await continue_btn.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(random.randint(700, 1500))
+                    await page.wait_for_timeout(random.randint(1000, 2500))
 
                     # 点击前记录上下文，便于判断是否提交成功。
                     before_ctx = await page.evaluate(
@@ -1406,7 +1449,7 @@ class CamoufoxSession:
                     if not click_sent:
                         raise RuntimeError("Continue 点击动作未执行成功")
 
-                    await page.wait_for_timeout(random.randint(600, 1300))
+                    await page.wait_for_timeout(random.randint(900, 2200))
                     self._trace("Continue 已点击，开始等待页面前进信号")
 
                     progressed = False
@@ -1508,7 +1551,7 @@ class CamoufoxSession:
                         name_continue_btn = page.locator(name_continue_selector).first
                         await name_continue_btn.wait_for(state="visible", timeout=15000)
                         await name_continue_btn.scroll_into_view_if_needed()
-                        await page.wait_for_timeout(random.randint(500, 1000))
+                        await page.wait_for_timeout(random.randint(800, 1800))
 
                         name_submitted = False
                         for _ in range(3):
@@ -1641,7 +1684,7 @@ class CamoufoxSession:
                                     arg=verification_code,
                                     timeout=10000,
                                 )
-                                await page.wait_for_timeout(random.randint(400, 900))
+                                await page.wait_for_timeout(random.randint(600, 1500))
 
                                 verify_clicked = False
                                 try:

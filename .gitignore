@@ -9,3 +9,5 @@ data/
 node_modules/
 dist/
 build/
+.claude/
+.omc/
