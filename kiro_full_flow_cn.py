@@ -1265,21 +1265,21 @@ class CamoufoxSession:
                 firefox_prefs["network.proxy.no_proxies_on"] = "localhost, 127.0.0.1, ::1"
             # 启用代理时开启 geoip，自动匹配代理 IP 地区的指纹
             use_geoip = proxy_config is not None
-            # WebGL 伪装：使用常见 GPU 配置，避免 headless 环境下 WebGL 为空
-            # 格式: (vendor, renderer)
+            # WebGL 伪装：使用 Camoufox 预定义的 GPU 配置，避免 headless 环境下 WebGL 为空
+            # 注意: vendor/renderer 必须完全匹配 camoufox.webgl.sample.get_possible_pairs() 中的值
             webgl_configs = {
                 "win": [
-                    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0)"),
-                    ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0)"),
-                    ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0)"),
+                    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 980 Direct3D11 vs_5_0 ps_5_0), or similar"),
+                    ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) HD Graphics 400 Direct3D11 vs_5_0 ps_5_0), or similar"),
+                    ("Google Inc. (AMD)", "ANGLE (AMD, Radeon R9 200 Series Direct3D11 vs_5_0 ps_5_0), or similar"),
                 ],
                 "mac": [
-                    ("Apple Inc.", "Apple M1"),
-                    ("Intel Inc.", "Intel(R) Iris(R) Plus Graphics 640"),
+                    ("Apple", "Apple M1, or similar"),
+                    ("Intel Inc.", "Intel(R) HD Graphics 400, or similar"),
                 ],
                 "lin": [
-                    ("NVIDIA Corporation", "NVIDIA GeForce GTX 1060/PCIe/SSE2"),
-                    ("Intel", "Intel(R) UHD Graphics 630 (CFL GT2)"),
+                    ("NVIDIA Corporation", "NVIDIA GeForce GTX 980, or similar"),
+                    ("Intel", "Intel(R) HD Graphics 400, or similar"),
                 ],
             }
             # 根据目标 OS 选择对应的 GPU 列表
