@@ -926,6 +926,14 @@ def camoufox_sleep_ms(name: str, default_min: int, default_max: int) -> int:
     return random.randint(min_ms, max_ms)
 
 
+def camoufox_float_value(name: str, default_min: float, default_max: float) -> float:
+    configured = APP_CONFIG.flow.camoufox_timings.get(name)
+    if configured is not None:
+        min_v, max_v = configured
+        return random.uniform(float(min_v), float(max_v))
+    return random.uniform(default_min, default_max)
+
+
 async def random_trajectory_click(page, locator, trace_func=None, timeout=10000):
     box = None
     try:
@@ -938,22 +946,36 @@ async def random_trajectory_click(page, locator, trace_func=None, timeout=10000)
     if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
         cx = box["x"] + box["width"] / 2
         cy = box["y"] + box["height"] / 2
-        jx = random.uniform(-min(8.0, box["width"] / 5), min(8.0, box["width"] / 5))
-        jy = random.uniform(-min(6.0, box["height"] / 5), min(6.0, box["height"] / 5))
+        target_jitter_x = min(
+            camoufox_float_value("clickTargetJitterXMaxPx", 8.0, 8.0),
+            box["width"] / 5,
+        )
+        target_jitter_y = min(
+            camoufox_float_value("clickTargetJitterYMaxPx", 6.0, 6.0),
+            box["height"] / 5,
+        )
+        jx = random.uniform(-target_jitter_x, target_jitter_x)
+        jy = random.uniform(-target_jitter_y, target_jitter_y)
         tx = max(1.0, cx + jx)
         ty = max(1.0, cy + jy)
 
-        sx = max(1.0, tx + random.uniform(-180, -70))
-        sy = max(1.0, ty + random.uniform(-90, 90))
+        sx = max(
+            1.0,
+            tx + camoufox_float_value("clickStartOffsetXMinPx", -180.0, -70.0),
+        )
+        sy = max(
+            1.0,
+            ty + camoufox_float_value("clickStartOffsetYMinPx", -90.0, 90.0),
+        )
         await page.mouse.move(sx, sy)
         # 扩大起始等待范围，添加更自然的思考时间
         await page.wait_for_timeout(camoufox_sleep_ms("clickStartPauseMs", 150, 400))
 
-        steps = random.randint(4, 7)
+        steps = camoufox_sleep_ms("clickPathSteps", 4, 7)
         for step in range(1, steps + 1):
             ratio = step / steps
-            mx = sx + (tx - sx) * ratio + random.uniform(-1.8, 1.8)
-            my = sy + (ty - sy) * ratio + random.uniform(-1.2, 1.2)
+            mx = sx + (tx - sx) * ratio + camoufox_float_value("clickPathJitterXMaxPx", -1.8, 1.8)
+            my = sy + (ty - sy) * ratio + camoufox_float_value("clickPathJitterYMaxPx", -1.2, 1.2)
             await page.mouse.move(mx, my)
             # 扩大步骤间等待范围
             await page.wait_for_timeout(camoufox_sleep_ms("clickStepPauseMs", 60, 180))
@@ -1089,7 +1111,7 @@ class CamoufoxSession:
                 except Exception as err:
                     last_err = err
                     continue
-            await page.wait_for_timeout(250)
+            await page.wait_for_timeout(camoufox_sleep_ms("selectorPollPauseMs", 250, 250))
         raise RuntimeError(f"未找到可见元素: selectors={selectors}, last_err={last_err}")
 
     async def _auto_bind_mfa_from_security_page(self, page: Any) -> None:
@@ -1107,7 +1129,7 @@ class CamoufoxSession:
             "() => document.readyState === 'complete'",
             timeout=30000,
         )
-        await page.wait_for_timeout(2500)
+        await page.wait_for_timeout(camoufox_sleep_ms("mfaSecurityPageSettlePauseMs", 2500, 2500))
 
         register_btn = await self._wait_any_selector(
             page,
@@ -1120,7 +1142,7 @@ class CamoufoxSession:
         )
         self._trace("已进入安全页，准备点击注册设备")
         await random_trajectory_click(page, register_btn, self._trace, timeout=15000)
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(camoufox_sleep_ms("mfaRegisterPostClickPauseMs", 1500, 1500))
 
         next_btn = await self._wait_any_selector(
             page,
@@ -1138,7 +1160,7 @@ class CamoufoxSession:
             if self.mfa_seed and self.mfa_device_id:
                 found = True
                 break
-            await page.wait_for_timeout(250)
+            await page.wait_for_timeout(camoufox_sleep_ms("mfaSeedPollPauseMs", 250, 250))
         if not found:
             raise RuntimeError("未捕获到 MFA seed/deviceId")
 
@@ -1176,7 +1198,7 @@ class CamoufoxSession:
         await code_input.type(code, delay=camoufox_sleep_ms("mfaCodeTypeDelayMs", 35, 80))
         await page.wait_for_timeout(camoufox_sleep_ms("mfaCodePostTypePauseMs", 400, 1200))
         await random_trajectory_click(page, assign_btn, self._trace, timeout=15000)
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(camoufox_sleep_ms("mfaAssignPostClickPauseMs", 4000, 4000))
 
         body_text = ""
         try:
@@ -1541,7 +1563,7 @@ class CamoufoxSession:
                         if progressed:
                             self._trace("检测到页面已前进")
                             break
-                        await page.wait_for_timeout(1000)
+                        await page.wait_for_timeout(camoufox_sleep_ms("continueStatePollPauseMs", 1000, 1000))
 
                     if not progressed:
                         self._trace("等待期间未检测到页面前进信号，继续后续步骤")
@@ -1602,7 +1624,7 @@ class CamoufoxSession:
                             except Exception:
                                 pass
 
-                            await page.wait_for_timeout(2000)
+                            await page.wait_for_timeout(camoufox_sleep_ms("nameRetryPauseMs", 2000, 2000))
 
                             # 检测 IP 封禁错误
                             ip_blocked = await page.locator("text=/Sorry.*there was an error processing your request/i").count()
@@ -1617,7 +1639,7 @@ class CamoufoxSession:
                                 except Exception:
                                     pass
 
-                            await page.wait_for_timeout(1000)
+                            await page.wait_for_timeout(camoufox_sleep_ms("nameEnterPostPauseMs", 1000, 1000))
 
                             # 再次检测 IP 封禁错误
                             ip_blocked = await page.locator("text=/Sorry.*there was an error processing your request/i").count()
@@ -1736,7 +1758,7 @@ class CamoufoxSession:
                                         f"验证码页 Continue hover/click 失败: {verify_click_err}"
                                     )
 
-                                await page.wait_for_timeout(2500)
+                                await page.wait_for_timeout(camoufox_sleep_ms("verifyCodeSubmitPostPauseMs", 2500, 2500))
                                 if await verify_btn.is_visible():
                                     try:
                                         await code_input.press("Enter")
@@ -1850,7 +1872,7 @@ class CamoufoxSession:
                                             f"密码页 Continue hover/click 失败: {pwd_click_err}"
                                         )
 
-                                    await page.wait_for_timeout(2500)
+                                    await page.wait_for_timeout(camoufox_sleep_ms("passwordSubmitPostPauseMs", 2500, 2500))
                                     if await pwd_continue_btn.is_visible():
                                         try:
                                             await repwd_input.press("Enter")
