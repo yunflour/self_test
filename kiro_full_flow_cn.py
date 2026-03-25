@@ -36,7 +36,7 @@ import uuid
 import webbrowser
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import cbor2
@@ -68,6 +68,7 @@ class FlowConfig:
     camoufox_startup_timeout_s: Optional[int]
     camoufox_autofill_email: bool
     camoufox_auto_bind_mfa: bool
+    camoufox_timings: dict[str, tuple[int, int]]
     save_result: bool
     output_json: bool
     callback_port: Optional[int]
@@ -143,6 +144,24 @@ def _parse_headless(value: Any) -> Union[bool, str]:
     return True
 
 
+def _parse_timing_range(name: str, value: Any) -> tuple[int, int]:
+    if isinstance(value, int):
+        if value < 0:
+            raise RuntimeError(f"camoufoxTimings.{name} 不能为负数")
+        return value, value
+    if isinstance(value, list) and len(value) == 2:
+        min_v = int(value[0])
+        max_v = int(value[1])
+        if min_v < 0 or max_v < 0:
+            raise RuntimeError(f"camoufoxTimings.{name} 不能为负数")
+        if min_v > max_v:
+            raise RuntimeError(f"camoufoxTimings.{name} 最小值不能大于最大值")
+        return min_v, max_v
+    raise RuntimeError(
+        f"camoufoxTimings.{name} 格式错误，期望整数或 [min, max]"
+    )
+
+
 def generate_fingerprint() -> str:
     """
     生成随机的浏览器指纹，格式为 32 位小写十六进制字符串（标准 MD5 格式）。
@@ -167,6 +186,12 @@ def load_app_config() -> AppConfig:
     flow_raw = _require_key(raw, "flow", dict)
     shortmail_raw = _require_key(raw, "shortmail", dict)
     token_output_raw = _require_key(raw, "tokenOutput", dict)
+
+    camoufox_timings_raw = flow_raw.get("camoufoxTimings", {})
+    if camoufox_timings_raw is None:
+        camoufox_timings_raw = {}
+    if not isinstance(camoufox_timings_raw, dict):
+        raise RuntimeError("配置项 flow.camoufoxTimings 必须是 JSON 对象")
 
     flow = FlowConfig(
         portal_url=str(_require_key(flow_raw, "portalUrl", str)),
@@ -197,6 +222,10 @@ def load_app_config() -> AppConfig:
             _require_key(flow_raw, "camoufoxAutofillEmail", bool)
         ),
         camoufox_auto_bind_mfa=bool(flow_raw.get("camoufoxAutoBindMfa", True)),
+        camoufox_timings={
+            str(k): _parse_timing_range(str(k), v)
+            for k, v in camoufox_timings_raw.items()
+        },
         save_result=bool(_require_key(flow_raw, "saveResult", bool)),
         output_json=bool(_require_key(flow_raw, "outputJson", bool)),
         callback_port=(
@@ -885,6 +914,18 @@ def build_refresh_token_bundle(
     }
 
 
+def camoufox_timing_range(name: str, default_min: int, default_max: int) -> tuple[int, int]:
+    configured = APP_CONFIG.flow.camoufox_timings.get(name)
+    if configured is not None:
+        return configured
+    return default_min, default_max
+
+
+def camoufox_sleep_ms(name: str, default_min: int, default_max: int) -> int:
+    min_ms, max_ms = camoufox_timing_range(name, default_min, default_max)
+    return random.randint(min_ms, max_ms)
+
+
 async def random_trajectory_click(page, locator, trace_func=None, timeout=10000):
     box = None
     try:
@@ -906,7 +947,7 @@ async def random_trajectory_click(page, locator, trace_func=None, timeout=10000)
         sy = max(1.0, ty + random.uniform(-90, 90))
         await page.mouse.move(sx, sy)
         # 扩大起始等待范围，添加更自然的思考时间
-        await page.wait_for_timeout(random.randint(150, 400))
+        await page.wait_for_timeout(camoufox_sleep_ms("clickStartPauseMs", 150, 400))
 
         steps = random.randint(4, 7)
         for step in range(1, steps + 1):
@@ -915,14 +956,14 @@ async def random_trajectory_click(page, locator, trace_func=None, timeout=10000)
             my = sy + (ty - sy) * ratio + random.uniform(-1.2, 1.2)
             await page.mouse.move(mx, my)
             # 扩大步骤间等待范围
-            await page.wait_for_timeout(random.randint(60, 180))
+            await page.wait_for_timeout(camoufox_sleep_ms("clickStepPauseMs", 60, 180))
 
         await page.mouse.move(tx, ty)
         # 扩大目标点等待范围
-        await page.wait_for_timeout(random.randint(120, 350))
+        await page.wait_for_timeout(camoufox_sleep_ms("clickBeforeDownPauseMs", 120, 350))
         await page.mouse.down()
         # 扩大按下等待范围
-        await page.wait_for_timeout(random.randint(80, 200))
+        await page.wait_for_timeout(camoufox_sleep_ms("clickHoldPauseMs", 80, 200))
         await page.mouse.up()
         click_sent = True
         if trace_func:
@@ -1132,8 +1173,8 @@ class CamoufoxSession:
             await code_input.press("Backspace")
         except Exception:
             pass
-        await code_input.type(code, delay=random.randint(35, 80))
-        await page.wait_for_timeout(random.randint(400, 1200))
+        await code_input.type(code, delay=camoufox_sleep_ms("mfaCodeTypeDelayMs", 35, 80))
+        await page.wait_for_timeout(camoufox_sleep_ms("mfaCodePostTypePauseMs", 400, 1200))
         await random_trajectory_click(page, assign_btn, self._trace, timeout=15000)
         await page.wait_for_timeout(4000)
 
@@ -1347,7 +1388,7 @@ class CamoufoxSession:
                         pass
 
                     # 用户反馈按钮点击过早，这里显式多等一段时间让页面脚本和动画稳定。
-                    await page.wait_for_timeout(random.randint(3000, 6000))
+                    await page.wait_for_timeout(camoufox_sleep_ms("emailPageSettlePauseMs", 3000, 6000))
 
                     self._trace("从姓名库选取姓名并申请短效邮箱")
                     picked_full_name, picked_email_username = pick_name_from_pool()
@@ -1394,7 +1435,7 @@ class CamoufoxSession:
                     except Exception:
                         pass
 
-                    await email_input.type(email, delay=random.randint(55, 110))
+                    await email_input.type(email, delay=camoufox_sleep_ms("emailTypeDelayMs", 55, 110))
                     self._trace("邮箱输入完成")
 
                     # 确保输入框值已写入并触发 blur，避免按钮状态未更新。
@@ -1411,7 +1452,7 @@ class CamoufoxSession:
                     except Exception:
                         pass
 
-                    await page.wait_for_timeout(random.randint(1000, 2500))
+                    await page.wait_for_timeout(camoufox_sleep_ms("emailPostTypePauseMs", 1000, 2500))
 
                     continue_btn = page.locator(primary_continue_selector).first
                     if await continue_btn.count() == 0:
@@ -1424,7 +1465,7 @@ class CamoufoxSession:
 
                     await continue_btn.wait_for(state="visible", timeout=60000)
                     await continue_btn.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(random.randint(1000, 2500))
+                    await page.wait_for_timeout(camoufox_sleep_ms("continuePreClickPauseMs", 1000, 2500))
 
                     # 点击前记录上下文，便于判断是否提交成功。
                     before_ctx = await page.evaluate(
@@ -1449,7 +1490,7 @@ class CamoufoxSession:
                     if not click_sent:
                         raise RuntimeError("Continue 点击动作未执行成功")
 
-                    await page.wait_for_timeout(random.randint(900, 2200))
+                    await page.wait_for_timeout(camoufox_sleep_ms("continuePostClickPauseMs", 900, 2200))
                     self._trace("Continue 已点击，开始等待页面前进信号")
 
                     progressed = False
@@ -1529,7 +1570,7 @@ class CamoufoxSession:
                             await name_input.press("Backspace")
                         except Exception:
                             pass
-                        await name_input.type(full_name, delay=random.randint(50, 100))
+                        await name_input.type(full_name, delay=camoufox_sleep_ms("nameTypeDelayMs", 50, 100))
                         self._trace(f"姓名输入完成: {full_name}")
 
                         await page.wait_for_function(
@@ -1551,7 +1592,7 @@ class CamoufoxSession:
                         name_continue_btn = page.locator(name_continue_selector).first
                         await name_continue_btn.wait_for(state="visible", timeout=15000)
                         await name_continue_btn.scroll_into_view_if_needed()
-                        await page.wait_for_timeout(random.randint(800, 1800))
+                        await page.wait_for_timeout(camoufox_sleep_ms("namePreClickPauseMs", 800, 1800))
 
                         name_submitted = False
                         for _ in range(3):
@@ -1672,7 +1713,8 @@ class CamoufoxSession:
                                 except Exception:
                                     pass
                                 await code_input.type(
-                                    verification_code, delay=random.randint(40, 90)
+                                    verification_code,
+                                    delay=camoufox_sleep_ms("verifyCodeTypeDelayMs", 40, 90),
                                 )
                                 self._trace("验证码输入完成")
 
@@ -1684,7 +1726,7 @@ class CamoufoxSession:
                                     arg=verification_code,
                                     timeout=10000,
                                 )
-                                await page.wait_for_timeout(random.randint(600, 1500))
+                                await page.wait_for_timeout(camoufox_sleep_ms("verifyCodePostTypePauseMs", 600, 1500))
 
                                 verify_clicked = False
                                 try:
@@ -1766,7 +1808,8 @@ class CamoufoxSession:
                                     except Exception:
                                         pass
                                     await pwd_input.type(
-                                        password_value, delay=random.randint(35, 85)
+                                        password_value,
+                                        delay=camoufox_sleep_ms("passwordTypeDelayMs", 35, 85),
                                     )
 
                                     await repwd_input.click()
@@ -1776,7 +1819,8 @@ class CamoufoxSession:
                                     except Exception:
                                         pass
                                     await repwd_input.type(
-                                        password_value, delay=random.randint(35, 85)
+                                        password_value,
+                                        delay=camoufox_sleep_ms("passwordConfirmTypeDelayMs", 35, 85),
                                     )
                                     self._trace("密码与确认密码输入完成")
 
@@ -1796,9 +1840,7 @@ class CamoufoxSession:
                                         }}""",
                                         timeout=20000,
                                     )
-                                    await page.wait_for_timeout(
-                                        random.randint(500, 1000)
-                                    )
+                                    await page.wait_for_timeout(camoufox_sleep_ms("passwordPreClickPauseMs", 500, 1000))
 
                                     pwd_submitted = False
                                     try:
@@ -1843,9 +1885,7 @@ class CamoufoxSession:
                                             allow_access_selector
                                         ).first
                                         await allow_btn.scroll_into_view_if_needed()
-                                        await page.wait_for_timeout(
-                                            random.randint(400, 900)
-                                        )
+                                        await page.wait_for_timeout(camoufox_sleep_ms("allowAccessPreClickPauseMs", 400, 900))
                                         if self.auto_bind_mfa:
                                             try:
                                                 mfa_page = await context.new_page()
