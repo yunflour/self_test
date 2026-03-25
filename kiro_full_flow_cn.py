@@ -145,14 +145,20 @@ def _parse_headless(value: Any) -> Union[bool, str]:
 
 
 def _parse_timing_range(name: str, value: Any) -> tuple[int, int]:
+    allow_negative = name in {
+        "clickStartOffsetXMinPx",
+        "clickStartOffsetYMinPx",
+        "clickPathJitterXMaxPx",
+        "clickPathJitterYMaxPx",
+    }
     if isinstance(value, int):
-        if value < 0:
+        if value < 0 and not allow_negative:
             raise RuntimeError(f"camoufoxTimings.{name} 不能为负数")
         return value, value
     if isinstance(value, list) and len(value) == 2:
         min_v = int(value[0])
         max_v = int(value[1])
-        if min_v < 0 or max_v < 0:
+        if (min_v < 0 or max_v < 0) and not allow_negative:
             raise RuntimeError(f"camoufoxTimings.{name} 不能为负数")
         if min_v > max_v:
             raise RuntimeError(f"camoufoxTimings.{name} 最小值不能大于最大值")
