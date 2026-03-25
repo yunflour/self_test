@@ -540,36 +540,57 @@ def main() -> None:
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = []
-            for idx in range(args.count):
-                # 检查停止信号
+            future_to_idx: dict[Any, int] = {}
+            next_idx = 0
+
+            def submit_task(task_idx: int) -> None:
+                fut = executor.submit(
+                    run_one,
+                    run_id,
+                    task_idx + 1,
+                    args.count,
+                    args.python,
+                    args.script,
+                    env,
+                    timeout_val,
+                )
+                future_to_idx[fut] = task_idx
+
+            initial_workers = min(args.workers, args.count)
+            for _ in range(initial_workers):
                 if _state.should_stop():
                     break
-                futures.append(
-                    executor.submit(
-                        run_one,
-                        run_id,
-                        idx + 1,
-                        args.count,
-                        args.python,
-                        args.script,
-                        env,
-                        timeout_val,
-                    )
-                )
-                if idx < args.count - 1:
-                    # 随机错峰启动：2-8秒，避免固定1秒批量特征
+                submit_task(next_idx)
+                submitted_task_no = next_idx + 1
+                next_idx += 1
+                if next_idx < args.count:
+                    # 随机错峰启动：2-8秒，避免固定批量特征。
                     sleep_delay = random.uniform(2.0, 8.0)
-                    log(f"任务 {idx + 1} 已提交，等待 {sleep_delay:.1f}s 后提交下一个")
+                    log(f"任务 {submitted_task_no} 已提交，等待 {sleep_delay:.1f}s 后继续补位")
                     time.sleep(sleep_delay)
 
-            for fut in as_completed(futures):
+            while future_to_idx:
+                done_iter = as_completed(list(future_to_idx.keys()), timeout=None)
+                fut = next(done_iter)
+                task_idx = future_to_idx.pop(fut)
                 try:
                     result = fut.result()
                     _state.add_result(result)
                 except Exception as e:
                     log(f"获取任务结果异常: {e}")
-                    _state.add_result({"id": "unknown", "status": "failed", "error": str(e)})
+                    _state.add_result({"id": f"{run_id}-{task_idx + 1}", "status": "failed", "error": str(e)})
+
+                if _state.should_stop():
+                    continue
+
+                if next_idx < args.count:
+                    submit_task(next_idx)
+                    submitted_task_no = next_idx + 1
+                    if next_idx < args.count - 1:
+                        sleep_delay = random.uniform(2.0, 8.0)
+                        log(f"任务 {submitted_task_no} 已提交，等待 {sleep_delay:.1f}s 后继续补位")
+                        time.sleep(sleep_delay)
+                    next_idx += 1
     except KeyboardInterrupt:
         print(f"\n⚠️ 用户中断，正在退出...")
 
