@@ -405,30 +405,71 @@ def mask_secret(value: str, head: int = 16, tail: int = 8) -> str:
     return f"{value[:head]}...{value[-tail:]}"
 
 
+def _browser_accept_language() -> str:
+    # Camoufox 当前显式使用 en-US；手工 API 头至少保持语言维度一致。
+    return "en-US,en;q=0.9"
+
+
+def _browser_like_user_agent() -> str:
+    shortmail = APP_CONFIG.shortmail
+    ua = (shortmail.user_agent or "").strip()
+    if ua:
+        ua_lower = ua.lower()
+        # ShortMail 示例历史上常填 Chrome UA，这里收敛到更接近 Camoufox 的 Firefox 风格。
+        if "firefox/" in ua_lower:
+            return ua
+    selected_os = APP_CONFIG.flow.camoufox_os.strip().lower()
+    if selected_os == "auto":
+        selected_os = "linux"
+    if selected_os == "windows":
+        platform = "Windows NT 10.0; Win64; x64"
+    elif selected_os == "macos":
+        platform = "Macintosh; Intel Mac OS X 10.15"
+    else:
+        platform = "X11; Linux x86_64"
+    return f"Mozilla/5.0 ({platform}; rv:136.0) Gecko/20100101 Firefox/136.0"
+
+
+def _browser_like_headers(
+    *,
+    accept: str,
+    origin: Optional[str] = None,
+    referer: Optional[str] = None,
+    content_type: Optional[str] = None,
+) -> dict[str, str]:
+    headers = {
+        "accept": accept,
+        "accept-language": _browser_accept_language(),
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "user-agent": _browser_like_user_agent(),
+    }
+    if origin:
+        headers["origin"] = origin
+    if referer:
+        headers["referer"] = referer
+    if content_type:
+        headers["content-type"] = content_type
+    return headers
+
+
 def _shortmail_headers(token: Optional[str] = None, admin_key: Optional[str] = None) -> dict[str, str]:
     shortmail = APP_CONFIG.shortmail
-    headers = {
-        "accept": "application/json, text/plain, */*",
-        "accept-language": "zh-CN,zh;q=0.9",
-        "cache-control": "no-cache",
-        "origin": shortmail.origin,
-        "pragma": "no-cache",
-        "priority": "u=1, i",
-        "referer": f"{shortmail.origin}/",
-        "sec-ch-ua": '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-        "user-agent": shortmail.user_agent,
-        "x-admin-auth": "",
-        "x-custom-auth": "",
-        "x-fingerprint": shortmail.fingerprint,
-        "x-lang": "zh",
-        "x-user-token": "",
-        "content-type": "application/json",
-    }
+    headers = _browser_like_headers(
+        accept="application/json, text/plain, */*",
+        origin=shortmail.origin,
+        referer=f"{shortmail.origin}/",
+        content_type="application/json",
+    )
+    headers.update(
+        {
+            "x-admin-auth": "",
+            "x-custom-auth": "",
+            "x-fingerprint": shortmail.fingerprint,
+            "x-lang": "en",
+            "x-user-token": "",
+        }
+    )
     if token:
         headers["authorization"] = f"Bearer {token}"
     if admin_key:
@@ -2147,11 +2188,15 @@ def verify_bearer_credential(
     idc_region: str,
     profile_arn: str,
 ) -> dict[str, Any]:
-    headers = {
+    headers = _browser_like_headers(
+        accept="application/json",
+    )
+    headers.update(
+        {
         "Authorization": authorization_header,
-        "accept": "application/json",
         "x-amz-user-agent": "aws-sdk-js/1.0.0 KiroIDE-script",
-    }
+        }
+    )
     base = f"https://q.{idc_region}.amazonaws.com"
 
     out: dict[str, Any] = {
@@ -2416,10 +2461,12 @@ def initiate_login(
             payload["startUrl"] = start_url
 
     headers = {
-        "content-type": "application/cbor",
-        "accept": "application/cbor",
+        **_browser_like_headers(
+            accept="application/cbor",
+            origin=portal_url.rstrip("/"),
+            content_type="application/cbor",
+        ),
         "smithy-protocol": "rpc-v2-cbor",
-        "origin": portal_url.rstrip("/"),
         "x-kiro-visitorid": make_visitor_id(),
     }
     resp = session.post(url, data=cbor2.dumps(payload), headers=headers, timeout=20)
